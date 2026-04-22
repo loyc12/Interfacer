@@ -96,6 +96,59 @@
               "content": { "type": "string", "description": "Instructions to append to the system prompt" }
             }
           }
+        },
+        "interfacer.fileBlocklist": {
+          "type": "array",
+          "default": [
+            "node_modules/**",
+            "dist/**",
+            "build/**",
+            "out/**",
+            "coverage/**",
+            ".nyc_output/**",
+            "__pycache__/**",
+            "target/**",
+            "vendor/**",
+            "**/*.min.js",
+            "**/*.min.css",
+            "**/*.map",
+            "**/*.lock",
+            "**/*.pyc",
+            "**/*.class"
+          ],
+          "description": "Glob patterns for files to always exclude when adding files or folders to context. * matches any chars except /; ** matches across directories. Managed in the ⚙ Settings panel.",
+          "items": { "type": "string" }
+        },
+        "interfacer.fileAllowlist": {
+          "type": "array",
+          "default": [],
+          "description": "Glob patterns for files to include when adding folders to context. If non-empty, replaces the built-in text-extension filter — only matching files are added. Examples: src/**, *.ts, *.py.",
+          "items": { "type": "string" }
+        },
+        "interfacer.extraTextExtensions": {
+          "type": "array",
+          "default": [],
+          "description": "Extra file extensions to treat as text when adding folders to context (e.g. \"zig\", \"lua\", \".v\"). Leading dot is optional. These extend the built-in list; files with unknown extensions are otherwise skipped.",
+          "items": { "type": "string" }
+        },
+        "interfacer.respectIgnoreFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "When adding a folder to context, merge patterns from .gitignore and .vscodeignore into the blocklist at use time. Patterns are not stored — toggling this off reverts to the explicit blocklist only."
+        },
+        "interfacer.filterProfiles": {
+          "type": "array",
+          "default": [],
+          "description": "Named blocklist/allowlist combinations. Managed in the ⚙ Settings panel under Filter Profiles.",
+          "items": {
+            "type": "object",
+            "required": ["name", "blocklist", "allowlist"],
+            "properties": {
+              "name":      { "type": "string" },
+              "blocklist": { "type": "array", "items": { "type": "string" } },
+              "allowlist": { "type": "array", "items": { "type": "string" } }
+            }
+          }
         }
       }
     },

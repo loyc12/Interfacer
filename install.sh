@@ -56,6 +56,7 @@ echo -e "${BOLD}Interfacer — install from source${NC}"
 echo "Extension ID : $EXTENSION_ID"
 echo "Output file  : $VSIX_FILE"
 echo "Build only   : $BUILD_ONLY"
+echo "Profile      : ${PROFILE:-default}"
 echo "---"
 
 # ── Step 1: Check prerequisites ───────────────────────────────────────────────
@@ -169,10 +170,20 @@ fi
 
 log_section "Installing extension into VS Code"
 
-if ! "$CODE_CMD" --install-extension "$VSIX_FILE" --force; then
+PROFILE_FLAG=()
+if [ -n "$PROFILE" ]; then
+    PROFILE_FLAG=(--profile "$PROFILE")
+    log_info "Target profile: $PROFILE"
+else
+    log_warn "No --profile specified — installing into the default profile."
+    log_warn "If you use a non-default profile, re-run with --profile=<name>"
+    log_warn "or install manually: Extensions view → '...' → 'Install from VSIX…'"
+fi
+
+if ! "$CODE_CMD" "${PROFILE_FLAG[@]}" --install-extension "$VSIX_FILE" --force; then
     die "VS Code extension install failed.
        Try installing manually:
-         $CODE_CMD --install-extension $VSIX_FILE
+         $CODE_CMD ${PROFILE_FLAG[*]} --install-extension $VSIX_FILE
        Or via the UI: Extensions view → '...' menu → 'Install from VSIX…'"
 fi
 

@@ -4,23 +4,33 @@
 
 When you add, remove, or rename **any** user-facing feature, go through this list before closing the PR / ending the session. Skipping items will cause the in-extension help to drift from reality.
 
-| # | What changed? | What to update |
-|---|---|---|
-| 1 | New command registered in `activate()` | Add to `package.json` → `contributes.commands` |
-| 2 | New command | Add entry to the **Commands** section of the info view in `buildWebviewHtml()` |
-| 3 | New keyboard shortcut | Add to `package.json` → `contributes.keybindings` AND to **Keyboard Shortcuts** in info view |
-| 4 | New toolbar button in the webview | Add to **Toolbar Buttons** in info view |
-| 5 | New context menu entry (`editor/context`, `editor/title/context`, etc.) | Add to `package.json` → `contributes.menus` AND to **Editor Menus** in info view |
-| 6 | New VS Code setting | Add to `package.json` → `contributes.configuration.properties` AND to **Settings** in info view |
-| 7 | Change to the system prompt | Update **System Prompt** section in info view |
-| 8 | New model added to `MODELS[]` | Update **Models** section in info view |
-| 9 | Behaviour change to an existing feature | Update the relevant description in the info view |
+|  # | What changed? | What to update |
+|----|---------------|----------------|
+|  1 | New command registered in `activate()` | Add to `package.json` → `contributes.commands` |
+|  2 | New command | Add entry to the **Commands** section of the info view in `buildWebviewHtml()` |
+|  3 | New keyboard shortcut | Add to `package.json` → `contributes.keybindings` AND to **Keyboard Shortcuts** in info view |
+|  4 | New toolbar button in the webview | Add to **Toolbar Buttons** in info view |
+|  5 | New context menu entry (`editor/context`, `editor/title/context`, etc.) | Add to `package.json` → `contributes.menus` AND to **Editor Menus** in info view |
+|  6 | New VS Code setting | Add to `package.json` → `contributes.configuration.properties` AND to **Settings** in info view |
+|  7 | Change to the system prompt | Update **System Prompt** section in info view |
+|  8 | New model added to `MODELS[]` | Update **Models** section in info view |
+|  9 | Behaviour change to an existing feature | Update the relevant description in the info view |
 | 10 | New or changed preset | Update `DEFAULT_PRESETS` array if it's a shipped default; remind user in CHANGELOG |
 | 11 | System prompt default changed | Update `DEFAULT_SYSTEM_PROMPT` constant AND the reset button target in `svResetPrompt` listener |
 | 12 | Any of the above | Re-read the full info view to check for stale text |
 
 The info view lives entirely inside `buildWebviewHtml()` in [src/extension.ts](src/extension.ts),
 in the `<div id="info-view">` block. It is plain HTML — edit it directly.
+
+## ⚠ INVARIANT: Every setting must be both a VS Code setting AND have a UI entry point
+
+Every user-configurable value **must** satisfy both of the following, without exception:
+
+1. **Registered in `package.json` → `contributes.configuration.properties`** with a type, default, and description. This makes it discoverable in the VS Code settings UI, persistable in `settings.json`, and readable via `vscode.workspace.getConfiguration()`.
+
+2. **Editable from within the extension's own UI** — either through the ⚙ Settings panel (preferred for free-form values), a dedicated command/button (e.g. model switcher via status bar, API key via 🔑), or a QuickPick. Users should never need to open `settings.json` to configure Interfacer.
+
+When adding a new configurable value: add the `package.json` entry first, then add the panel UI, then wire `sendSettings()` and `updateSettings` so the panel stays in sync when the value is changed externally (e.g. via settings.json).
 
 ---
 

@@ -43,6 +43,7 @@ const SECRET_KEY = 'interfacer.apiKey';
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface Preset { name: string; content: string; }
+interface FilterProfile { name: string; blocklist: string[]; allowlist: string[]; }
 
 interface ContextItem {
 	label: string;
@@ -79,8 +80,14 @@ class InterfacerViewProvider implements vscode.WebviewViewProvider {
 		const config = vscode.workspace.getConfiguration('interfacer');
 		const initSystemPrompt = config.get<string>('systemPrompt') || DEFAULT_SYSTEM_PROMPT;
 		const initPresets      = config.get<Preset[]>('promptPresets') ?? DEFAULT_PRESETS;
+		const initBlocklist      = config.get<string[]>('fileBlocklist') ?? [];
+		const initAllowlist      = config.get<string[]>('fileAllowlist') ?? [];
+		const initExtraExts      = config.get<string[]>('extraTextExtensions') ?? [];
+		const initMaxChars       = config.get<number>('maxContextChars') ?? 40000;
+		const initFilterProfiles = config.get<FilterProfile[]>('filterProfiles') ?? [];
+		const initRespectIgnore  = config.get<boolean>('respectIgnoreFiles') ?? true;
 
-		webviewView.webview.html = buildWebviewHtml(initSystemPrompt, initPresets);
+		webviewView.webview.html = buildWebviewHtml(initSystemPrompt, initPresets, initBlocklist, initAllowlist, initExtraExts, initMaxChars, initFilterProfiles, initRespectIgnore);
 
 		webviewView.webview.onDidReceiveMessage(async (msg) => {
 			switch (msg.type) {
@@ -109,6 +116,31 @@ class InterfacerViewProvider implements vscode.WebviewViewProvider {
 					await cfg.update('promptPresets', msg.presets as Preset[], vscode.ConfigurationTarget.Global);
 					break;
 				}
+				case 'saveFilters': {
+					const cfg = vscode.workspace.getConfiguration('interfacer');
+					await cfg.update('fileBlocklist', msg.blocklist as string[], vscode.ConfigurationTarget.Global);
+					await cfg.update('fileAllowlist', msg.allowlist as string[], vscode.ConfigurationTarget.Global);
+					await cfg.update('extraTextExtensions', msg.extraTextExts as string[], vscode.ConfigurationTarget.Global);
+					break;
+				}
+				case 'saveFilterProfiles': {
+					const cfg = vscode.workspace.getConfiguration('interfacer');
+					await cfg.update('filterProfiles', msg.profiles as FilterProfile[], vscode.ConfigurationTarget.Global);
+					break;
+				}
+				case 'saveRespectIgnore': {
+					const cfg = vscode.workspace.getConfiguration('interfacer');
+					await cfg.update('respectIgnoreFiles', msg.value as boolean, vscode.ConfigurationTarget.Global);
+					break;
+				}
+				case 'saveMaxChars': {
+					const cfg = vscode.workspace.getConfiguration('interfacer');
+					const val = Number(msg.value);
+					if (Number.isFinite(val) && val > 0) {
+						await cfg.update('maxContextChars', val, vscode.ConfigurationTarget.Global);
+					}
+					break;
+				}
 			}
 		}, null, this.context.subscriptions);
 	}
@@ -121,8 +153,14 @@ class InterfacerViewProvider implements vscode.WebviewViewProvider {
 		const config = vscode.workspace.getConfiguration('interfacer');
 		this.post({
 			type: 'updateSettings',
-			systemPrompt: config.get<string>('systemPrompt') || DEFAULT_SYSTEM_PROMPT,
-			presets:      config.get<Preset[]>('promptPresets') ?? DEFAULT_PRESETS,
+			systemPrompt:     config.get<string>('systemPrompt') || DEFAULT_SYSTEM_PROMPT,
+			presets:          config.get<Preset[]>('promptPresets') ?? DEFAULT_PRESETS,
+			blocklist:        config.get<string[]>('fileBlocklist') ?? [],
+			allowlist:        config.get<string[]>('fileAllowlist') ?? [],
+			extraTextExts:    config.get<string[]>('extraTextExtensions') ?? [],
+			maxChars:         config.get<number>('maxContextChars') ?? 40000,
+			filterProfiles:   config.get<FilterProfile[]>('filterProfiles') ?? [],
+			respectIgnore:    config.get<boolean>('respectIgnoreFiles') ?? true,
 		});
 	}
 }
@@ -158,7 +196,13 @@ export function activate(context: vscode.ExtensionContext) {
 				provider.post({ type: 'modelChanged', label: match?.label ?? 'Haiku' });
 			}
 			if (e.affectsConfiguration('interfacer.systemPrompt') ||
-			    e.affectsConfiguration('interfacer.promptPresets')) {
+			    e.affectsConfiguration('interfacer.promptPresets') ||
+			    e.affectsConfiguration('interfacer.fileBlocklist') ||
+			    e.affectsConfiguration('interfacer.fileAllowlist') ||
+			    e.affectsConfiguration('interfacer.extraTextExtensions') ||
+			    e.affectsConfiguration('interfacer.maxContextChars') ||
+			    e.affectsConfiguration('interfacer.filterProfiles') ||
+			    e.affectsConfiguration('interfacer.respectIgnoreFiles')) {
 				provider.sendSettings();
 			}
 		}),
@@ -366,16 +410,221 @@ async function injectSelectionContext() {
 }
 
 async function injectFileContext() {
-	const uris = await vscode.window.showOpenDialog({
-		canSelectMany: true,
-		openLabel: 'Add to context',
-		title: 'Interfacer — add files as context',
+	const mode = await vscode.window.showQuickPick(
+		[
+			{ label: '📄 Pick files',   description: 'Choose one or more individual files', value: 'files' },
+			{ label: '📁 Pick folder',  description: 'Add all text files inside a folder (recursive)', value: 'folder' },
+		],
+		{ title: 'Interfacer — add to context', placeHolder: 'What do you want to add?' }
+	);
+	if (!mode) { return; }
+
+	if (mode.value === 'files') {
+		const uris = await vscode.window.showOpenDialog({
+			canSelectMany: true,
+			canSelectFiles: true,
+			canSelectFolders: false,
+			openLabel: 'Add to context',
+			title: 'Interfacer — pick files',
+		});
+		if (!uris || uris.length === 0) { return; }
+		for (const uri of uris) { await addUriToContext(uri); }
+
+	} else {
+		const uris = await vscode.window.showOpenDialog({
+			canSelectMany: false,
+			canSelectFiles: false,
+			canSelectFolders: true,
+			openLabel: 'Add all files in folder',
+			title: 'Interfacer — pick folder',
+		});
+		if (!uris || uris.length === 0) { return; }
+		await addFolderToContext(uris[0]);
+	}
+}
+
+// Text file extensions considered safe to read as UTF-8
+const TEXT_EXTENSIONS = new Set([
+	'ts','tsx','js','jsx','mjs','cjs','json','jsonc',
+	'html','htm','css','scss','less','svelte','vue',
+	'py','pyi','rb','rs','go','java','kt','kts','swift','c','h','cpp','hpp','cc','hh','cs',
+	'zig','lua','dart','ex','exs','erl','hrl','elm','ml','mli','fs','fsx','fsi',
+	'r','rmd','jl','scala','clj','cljs','cljc','groovy','gradle',
+	'php','pl','pm','tcl','awk','sed',
+	'sh','bash','zsh','fish','ps1','bat','cmd',
+	'md','mdx','txt','rst','yaml','yml','toml','ini','env','cfg','conf','properties',
+	'sql','graphql','gql','proto','xml','csv','tsv','log',
+	'makefile','dockerfile','gitignore','editorconfig','prettierrc','eslintrc','babelrc',
+	'tf','tfvars','bicep','nix','cmake','lock',
+]);
+
+function isTextFile(uri: vscode.Uri, extra: Set<string> = new Set()): boolean {
+	const name = uri.path.split('/').pop() ?? '';
+	if (['makefile','dockerfile','.gitignore','.editorconfig','.env'].includes(name.toLowerCase())) { return true; }
+	const ext = name.includes('.') ? name.split('.').pop()!.toLowerCase() : '';
+	return TEXT_EXTENSIONS.has(ext) || extra.has(ext);
+}
+
+// Parses lines from a .gitignore / .vscodeignore file into glob patterns,
+// stripping comments, blank lines, and negation patterns.
+function parseIgnoreLines(lines: string[]): string[] {
+	return lines
+		.map((l) => l.trim())
+		.filter((l) => l.length > 0 && !l.startsWith('#') && !l.startsWith('!'));
+}
+
+// Reads .gitignore and .vscodeignore from the workspace root(s) and the
+// given folder, merges the patterns, and deduplicates them.
+async function readIgnorePatterns(folderUri: vscode.Uri): Promise<string[]> {
+	const patterns: string[] = [];
+	const roots = new Set<string>([folderUri.toString()]);
+	for (const wsFolder of vscode.workspace.workspaceFolders ?? []) {
+		roots.add(wsFolder.uri.toString());
+	}
+	for (const rootStr of roots) {
+		const rootUri = vscode.Uri.parse(rootStr);
+		for (const file of ['.gitignore', '.vscodeignore']) {
+			try {
+				const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(rootUri, file));
+				patterns.push(...parseIgnoreLines(Buffer.from(bytes).toString('utf8').split('\n')));
+			} catch { /* not found */ }
+		}
+	}
+	return [...new Set(patterns)];
+}
+
+// Converts a gitignore-style glob pattern to a RegExp.
+// * matches any chars except /; ** matches across / boundaries.
+function globToRegex(pattern: string): RegExp {
+	const escaped = pattern
+		.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+		.replace(/\*\*/g, '\x00')
+		.replace(/\*/g, '[^/]*')
+		.replace(/\x00/g, '.*');
+	return new RegExp('^' + escaped + '$', 'i');
+}
+
+// Returns true if any pattern matches the file. Patterns without a '/' are
+// matched against the filename only; patterns with '/' are matched against
+// the path relative to the folder root (relPath).
+function matchesAnyPattern(patterns: string[], name: string, relPath: string): boolean {
+	return patterns.some((p) => {
+		const target = p.includes('/') ? relPath : name;
+		return globToRegex(p).test(target);
 	});
-	if (!uris || uris.length === 0) { return; }
-	for (const uri of uris) { await addUriToContext(uri); }
+}
+
+// Decides whether a file should be included. Accepts an optional effective
+// blocklist/allowlist (used by addFolderToContext after merging ignore files);
+// falls back to reading from config when called for single-file adds.
+function filePassesFilters(uri: vscode.Uri, relPath: string, effectiveBlocklist?: string[], effectiveAllowlist?: string[]): boolean {
+	if (!effectiveBlocklist || !effectiveAllowlist) {
+		const config = vscode.workspace.getConfiguration('interfacer');
+		effectiveBlocklist = effectiveBlocklist ?? config.get<string[]>('fileBlocklist') ?? [];
+		effectiveAllowlist = effectiveAllowlist ?? config.get<string[]>('fileAllowlist') ?? [];
+	}
+	const name = uri.path.split('/').pop() ?? '';
+	if (effectiveBlocklist.length > 0 && matchesAnyPattern(effectiveBlocklist, name, relPath)) { return false; }
+	if (effectiveAllowlist.length > 0) { return matchesAnyPattern(effectiveAllowlist, name, relPath); }
+	return true;
+}
+
+// Returns true if a directory should be skipped entirely before recursing.
+function dirIsBlocked(dirName: string, dirRelPath: string, effectiveBlocklist?: string[]): boolean {
+	effectiveBlocklist = effectiveBlocklist ?? vscode.workspace.getConfiguration('interfacer').get<string[]>('fileBlocklist') ?? [];
+	return effectiveBlocklist.some((p) => {
+		const stripped = p.endsWith('/**') ? p.slice(0, -3) : p.endsWith('/*') ? p.slice(0, -2) : null;
+		if (!stripped) { return false; }
+		const target = stripped.includes('/') ? dirRelPath : dirName;
+		return globToRegex(stripped).test(target);
+	});
+}
+
+async function addFolderToContext(folderUri: vscode.Uri) {
+	const config        = vscode.workspace.getConfiguration('interfacer');
+	const maxChars      = config.get<number>('maxContextChars') ?? 40000;
+	const userBlocklist = config.get<string[]>('fileBlocklist') ?? [];
+	const allowlist     = config.get<string[]>('fileAllowlist') ?? [];
+	const respectIgnore = config.get<boolean>('respectIgnoreFiles') ?? true;
+	const extraExts     = new Set(
+		(config.get<string[]>('extraTextExtensions') ?? []).map((e) => e.replace(/^\./, '').toLowerCase())
+	);
+
+	// Merge user blocklist with .gitignore/.vscodeignore patterns (computed now,
+	// not stored — stays in sync with ignore files without touching user settings).
+	let effectiveBlocklist = userBlocklist;
+	if (respectIgnore) {
+		const ignorePatterns = await readIgnorePatterns(folderUri);
+		effectiveBlocklist = [...new Set([...userBlocklist, ...ignorePatterns])];
+	}
+
+	// Recursively collect all files
+	const collect = async (dir: vscode.Uri): Promise<vscode.Uri[]> => {
+		const entries = await vscode.workspace.fs.readDirectory(dir);
+		const results: vscode.Uri[] = [];
+		for (const [name, type] of entries) {
+			if (name.startsWith('.')) { continue; } // skip hidden
+			const child   = vscode.Uri.joinPath(dir, name);
+			const relPath = child.path.substring(folderUri.path.length + 1);
+			if (type === vscode.FileType.Directory) {
+				if (dirIsBlocked(name, relPath, effectiveBlocklist)) { continue; }
+				results.push(...await collect(child));
+			} else if (type === vscode.FileType.File) {
+				const passesBuiltin = allowlist.length > 0 ? true : isTextFile(child, extraExts);
+				if (passesBuiltin && filePassesFilters(child, relPath, effectiveBlocklist, allowlist)) {
+					results.push(child);
+				}
+			}
+		}
+		return results;
+	};
+
+	const files = await collect(folderUri);
+	if (files.length === 0) {
+		const action = await vscode.window.showWarningMessage(
+			'Interfacer: no text files found in that folder. Unknown file extensions are excluded by default.',
+			'Open File Filters'
+		);
+		if (action === 'Open File Filters') {
+			provider.focus();
+			provider.post({ type: 'openSettings', section: 'filters' });
+		}
+		return;
+	}
+
+	// Confirm if large
+	const folderName = folderUri.path.split('/').pop() ?? 'folder';
+	if (files.length > 10) {
+		const confirm = await vscode.window.showQuickPick(
+			[`Add all ${files.length} files`, 'Cancel'],
+			{ placeHolder: `${folderName} contains ${files.length} text files. Continue?` }
+		);
+		if (confirm !== `Add all ${files.length} files`) { return; }
+	}
+
+	for (const uri of files.sort((a, b) => a.path.localeCompare(b.path))) {
+		const bytes = await vscode.workspace.fs.readFile(uri);
+		let text    = Buffer.from(bytes).toString('utf8');
+		let truncated = false;
+		if (text.length > maxChars) { text = text.slice(0, maxChars); truncated = true; }
+		const name      = uri.path.split('/').pop() ?? 'file';
+		const lineCount = text.split('\n').length;
+		provider.post({
+			type: 'addContext',
+			item: {
+				label: name + (truncated ? ' — truncated' : ''),
+				content: text, kind: 'file',
+				lineStart: 1, lineEnd: lineCount,
+			} satisfies ContextItem,
+		});
+	}
 }
 
 async function addUriToContext(uri: vscode.Uri) {
+	if (!filePassesFilters(uri, '')) {
+		vscode.window.showInformationMessage(`Interfacer: "${uri.path.split('/').pop()}" is excluded by your file filter settings.`);
+		return;
+	}
 	const config   = vscode.workspace.getConfiguration('interfacer');
 	const maxChars = config.get<number>('maxContextChars') ?? 40000;
 
@@ -466,13 +715,19 @@ function refreshStatusBar() {
 
 // ─── Webview HTML ─────────────────────────────────────────────────────────────
 
-function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[]): string {
+function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initBlocklist: string[], initAllowlist: string[], initExtraExts: string[], initMaxChars: number, initFilterProfiles: FilterProfile[], initRespectIgnore: boolean): string {
 	const nonce = crypto.randomBytes(16).toString('hex');
 
 	// Safely embed JS values
-	const jsSystemPrompt = JSON.stringify(initSystemPrompt);
-	const jsPresets      = JSON.stringify(initPresets);
-	const jsDefaultSys   = JSON.stringify(DEFAULT_SYSTEM_PROMPT);
+	const jsSystemPrompt    = JSON.stringify(initSystemPrompt);
+	const jsPresets         = JSON.stringify(initPresets);
+	const jsDefaultSys      = JSON.stringify(DEFAULT_SYSTEM_PROMPT);
+	const jsBlocklist       = JSON.stringify(initBlocklist);
+	const jsAllowlist       = JSON.stringify(initAllowlist);
+	const jsExtraExts       = JSON.stringify(initExtraExts);
+	const jsMaxChars        = JSON.stringify(initMaxChars);
+	const jsFilterProfiles  = JSON.stringify(initFilterProfiles);
+	const jsRespectIgnore   = JSON.stringify(initRespectIgnore);
 
 	return /* html */`<!DOCTYPE html>
 <html lang="en">
@@ -785,7 +1040,12 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[]): stri
     <div class="iv-row"><span class="iv-key">interfacer.model</span><span class="iv-val">Persisted model ID.</span></div>
     <div class="iv-row"><span class="iv-key">interfacer.systemPrompt</span><span class="iv-val">Editable system prompt. Reset to default available in ⚙ Settings.</span></div>
     <div class="iv-row"><span class="iv-key">interfacer.promptPresets</span><span class="iv-val">Array of <code>{ name, content }</code> preset objects. Managed in ⚙ Settings.</span></div>
-    <div class="iv-row"><span class="iv-key">interfacer.maxContextChars</span><span class="iv-val">Per-file character cap. Default: 40,000.</span></div>
+    <div class="iv-row"><span class="iv-key">interfacer.maxContextChars</span><span class="iv-val">Per-file character cap. Default: 40,000. Editable in ⚙ Settings → Context Limits.</span></div>
+    <div class="iv-row"><span class="iv-key">interfacer.fileBlocklist</span><span class="iv-val">Glob patterns for files to always exclude (e.g. <code>*.log</code>, <code>dist/**</code>). Managed in ⚙ Settings.</span></div>
+    <div class="iv-row"><span class="iv-key">interfacer.fileAllowlist</span><span class="iv-val">Glob patterns for files to include when adding folders. Non-empty replaces the built-in text-extension filter. Managed in ⚙ Settings.</span></div>
+    <div class="iv-row"><span class="iv-key">interfacer.extraTextExtensions</span><span class="iv-val">Extra file extensions (e.g. <code>zig</code>, <code>lua</code>) to treat as text. Files with unknown extensions are skipped unless listed here. Managed in ⚙ Settings → File Filters.</span></div>
+    <div class="iv-row"><span class="iv-key">interfacer.respectIgnoreFiles</span><span class="iv-val">When adding a folder, merge <code>.gitignore</code>/<code>.vscodeignore</code> patterns into the blocklist on use (not stored). Toggle in ⚙ Settings → File Filters.</span></div>
+    <div class="iv-row"><span class="iv-key">interfacer.filterProfiles</span><span class="iv-val">Named blocklist/allowlist combinations. Managed in ⚙ Settings → Filter Profiles.</span></div>
   </div>
   <div class="iv-section">
     <div class="iv-heading">System Prompt (current)</div>
@@ -834,6 +1094,57 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[]): stri
         <div class="spacer"></div>
         <button class="tool-btn primary" id="sv-form-save">Save Preset</button>
       </div>
+    </div>
+  </div>
+
+  <div class="sv-section">
+    <div class="sv-heading">File Filters</div>
+    <div class="sv-desc">Applied when adding files or folders to context. One glob pattern per line. <code>*</code> matches anything except <code>/</code>; <code>**</code> matches across directories. Patterns without <code>/</code> match the filename only; patterns with <code>/</code> match the path relative to the picked folder.</div>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;margin-top:8px;">
+      <input type="checkbox" id="sv-respect-ignore" />
+      <span style="font-size:0.88em;">Respect <code>.gitignore</code> and <code>.vscodeignore</code> — patterns are merged with the blocklist on use, not stored</span>
+    </label>
+    <div class="sv-form-label" style="margin-top:10px;">Blocklist — always exclude matching files</div>
+    <textarea id="sv-blocklist" class="sv-textarea" rows="4" placeholder="*.log&#10;dist/**&#10;node_modules/**&#10;**/*.min.js"></textarea>
+    <div class="sv-form-label" style="margin-top:8px;">Allowlist — if non-empty, only include matching files (overrides built-in extension check)</div>
+    <textarea id="sv-allowlist" class="sv-textarea" rows="4" placeholder="src/**&#10;*.ts&#10;*.py"></textarea>
+    <div class="sv-form-label" style="margin-top:8px;">Extra file extensions — extend the built-in text-file list (one per line, with or without leading dot)</div>
+    <div class="sv-desc" style="margin-bottom:4px;">Files with unknown extensions are skipped unless listed here or matched by the allowlist above. If folder add returns no files, this is the likely cause.</div>
+    <textarea id="sv-extra-exts" class="sv-textarea" rows="3" placeholder=".zig&#10;.lua&#10;.v"></textarea>
+    <div class="sv-btn-row">
+      <button class="tool-btn ghost" id="sv-reset-filters">Reset to defaults</button>
+      <div class="spacer"></div>
+      <span class="sv-saved-notice" id="sv-filters-saved" style="display:none;">Saved.</span>
+      <button class="tool-btn primary" id="sv-save-filters">Save</button>
+    </div>
+  </div>
+
+  <div class="sv-section">
+    <div class="sv-heading">Filter Profiles</div>
+    <div class="sv-desc">Named blocklist / allowlist combinations. Loading a profile fills the textareas above — review and click Save to apply.</div>
+    <div id="sv-fp-list"></div>
+    <button class="tool-btn secondary" id="sv-save-fp" style="align-self:flex-start;margin-top:4px;">↑ Save current filters as profile</button>
+    <div id="sv-fp-form">
+      <div class="sv-form-label">Profile name</div>
+      <input id="sv-fp-name" class="sv-input" placeholder="e.g. Python project, ignore tests…" />
+      <div class="sv-btn-row">
+        <button class="tool-btn ghost" id="sv-fp-cancel">Cancel</button>
+        <div class="spacer"></div>
+        <button class="tool-btn primary" id="sv-fp-save-btn">Save Profile</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="sv-section">
+    <div class="sv-heading">Context Limits</div>
+    <div class="sv-desc">Per-file character cap. Files longer than this limit are truncated and labelled "— truncated" when added to context.</div>
+    <div class="sv-form-label">Max characters per file</div>
+    <input type="number" id="sv-max-chars" class="sv-input" min="1000" max="2000000" step="1000" style="width:140px;" />
+    <div class="sv-btn-row" style="margin-top:6px;">
+      <button class="tool-btn ghost" id="sv-reset-maxchars">Reset to default (40,000)</button>
+      <div class="spacer"></div>
+      <span class="sv-saved-notice" id="sv-maxchars-saved" style="display:none;">Saved.</span>
+      <button class="tool-btn primary" id="sv-save-maxchars">Save</button>
     </div>
   </div>
 
@@ -886,6 +1197,22 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[]): stri
   const svFormContent = document.getElementById('sv-form-content');
   const svFormCancel  = document.getElementById('sv-form-cancel');
   const svFormSave    = document.getElementById('sv-form-save');
+  const svBlocklist    = document.getElementById('sv-blocklist');
+  const svAllowlist    = document.getElementById('sv-allowlist');
+  const svSaveFilters  = document.getElementById('sv-save-filters');
+  const svResetFilters = document.getElementById('sv-reset-filters');
+  const svFiltersSaved = document.getElementById('sv-filters-saved');
+  const svRespectIgnore= document.getElementById('sv-respect-ignore');
+  const svFpList       = document.getElementById('sv-fp-list');
+  const svSaveFp       = document.getElementById('sv-save-fp');
+  const svFpForm       = document.getElementById('sv-fp-form');
+  const svFpName       = document.getElementById('sv-fp-name');
+  const svFpCancel     = document.getElementById('sv-fp-cancel');
+  const svFpSaveBtn    = document.getElementById('sv-fp-save-btn');
+  const svMaxChars     = document.getElementById('sv-max-chars');
+  const svSaveMaxChars = document.getElementById('sv-save-maxchars');
+  const svResetMaxChars= document.getElementById('sv-reset-maxchars');
+  const svMaxCharsSaved= document.getElementById('sv-maxchars-saved');
 
   // ── State ───────────────────────────────────────────────────────────────────
   let currentView  = 'chat';
@@ -895,9 +1222,16 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[]): stri
   let nextId       = 0;
   let editingIndex = -1;  // -1 = adding new preset
 
-  let systemPrompt = ${jsSystemPrompt};
-  let presets      = ${jsPresets};
+  let systemPrompt   = ${jsSystemPrompt};
+  let presets        = ${jsPresets};
+  let blocklist      = ${jsBlocklist};
+  let allowlist      = ${jsAllowlist};
+  let extraTextExts  = ${jsExtraExts};
+  let maxChars       = ${jsMaxChars};
+  let filterProfiles = ${jsFilterProfiles};
+  let respectIgnore  = ${jsRespectIgnore};
   const DEFAULT_SYSTEM_PROMPT = ${jsDefaultSys};
+  const DEFAULT_MAX_CHARS = 40000;
 
   // ── View switching ──────────────────────────────────────────────────────────
   function showView(v) {
@@ -1017,6 +1351,123 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[]): stri
   function savePresetsToExtension() {
     vscode.postMessage({ type: 'savePresets', presets });
   }
+
+  // ── Settings view — file filters ────────────────────────────────────────────
+  const svExtraExts = document.getElementById('sv-extra-exts');
+  function loadFilters() {
+    svBlocklist.value = blocklist.join('\\n');
+    svAllowlist.value = allowlist.join('\\n');
+    svExtraExts.value = extraTextExts.join('\\n');
+    svRespectIgnore.checked = respectIgnore;
+  }
+  loadFilters();
+
+  function parsePatterns(textarea) {
+    return textarea.value.split('\\n').map((s) => s.trim()).filter((s) => s.length > 0 && !s.startsWith('#'));
+  }
+
+  svRespectIgnore.addEventListener('change', () => {
+    respectIgnore = svRespectIgnore.checked;
+    vscode.postMessage({ type: 'saveRespectIgnore', value: respectIgnore });
+  });
+
+  svSaveFilters.addEventListener('click', () => {
+    blocklist = parsePatterns(svBlocklist);
+    allowlist = parsePatterns(svAllowlist);
+    extraTextExts = svExtraExts.value.split('\\n').map((s) => s.trim().replace(/^\./, '')).filter((s) => s.length > 0);
+    vscode.postMessage({ type: 'saveFilters', blocklist, allowlist, extraTextExts });
+    svFiltersSaved.style.display = 'inline';
+    setTimeout(() => { svFiltersSaved.style.display = 'none'; }, 1500);
+  });
+
+  svResetFilters.addEventListener('click', () => {
+    svBlocklist.value = '';
+    svAllowlist.value = '';
+    svExtraExts.value = '';
+  });
+
+  // ── Settings view — filter profiles ────────────────────────────────────────
+  function renderFpList() {
+    svFpList.innerHTML = '';
+    if (filterProfiles.length === 0) {
+      const empty = document.createElement('div');
+      empty.style.cssText = 'font-size:0.82em;opacity:0.5;font-style:italic;padding:4px 0;';
+      empty.textContent = 'No profiles yet. Click "↑ Save current filters as profile" to create one.';
+      svFpList.appendChild(empty);
+      return;
+    }
+    filterProfiles.forEach((p, i) => {
+      const row = document.createElement('div');
+      row.className = 'sv-preset-item';
+      row.innerHTML =
+        '<div class="sv-preset-info">' +
+          '<div class="sv-preset-name">' + escHtml(p.name) + '</div>' +
+          '<div class="sv-preset-preview">Blocklist: ' + p.blocklist.length + ' pattern' + (p.blocklist.length !== 1 ? 's' : '') +
+          ' · Allowlist: ' + p.allowlist.length + ' pattern' + (p.allowlist.length !== 1 ? 's' : '') + '</div>' +
+        '</div>' +
+        '<div class="sv-preset-actions">' +
+          '<button class="tool-btn ghost" data-action="load"   data-i="' + i + '" style="padding:2px 6px;font-size:0.85em;">Load</button>' +
+          '<button class="tool-btn ghost" data-action="delete" data-i="' + i + '" style="padding:2px 6px;font-size:0.85em;">✕</button>' +
+        '</div>';
+      svFpList.appendChild(row);
+    });
+  }
+  renderFpList();
+
+  svFpList.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) { return; }
+    const i = parseInt(btn.dataset.i);
+    if (btn.dataset.action === 'load') {
+      svBlocklist.value = filterProfiles[i].blocklist.join('\\n');
+      svAllowlist.value = filterProfiles[i].allowlist.join('\\n');
+      svFiltersSaved.style.display = 'inline';
+      svFiltersSaved.textContent = 'Loaded — click Save to apply.';
+      setTimeout(() => { svFiltersSaved.style.display = 'none'; svFiltersSaved.textContent = 'Saved.'; }, 2500);
+    } else if (btn.dataset.action === 'delete') {
+      filterProfiles.splice(i, 1);
+      saveFilterProfiles();
+      renderFpList();
+    }
+  });
+
+  svSaveFp.addEventListener('click', () => {
+    svFpName.value = '';
+    svFpForm.classList.add('open');
+    svFpName.focus();
+  });
+
+  svFpCancel.addEventListener('click', () => { svFpForm.classList.remove('open'); });
+
+  svFpSaveBtn.addEventListener('click', () => {
+    const name = svFpName.value.trim();
+    if (!name) { return; }
+    filterProfiles.push({ name, blocklist: parsePatterns(svBlocklist), allowlist: parsePatterns(svAllowlist) });
+    svFpForm.classList.remove('open');
+    saveFilterProfiles();
+    renderFpList();
+  });
+
+  function saveFilterProfiles() {
+    vscode.postMessage({ type: 'saveFilterProfiles', profiles: filterProfiles });
+  }
+
+  // ── Settings view — context limits ──────────────────────────────────────────
+  function loadMaxChars() { svMaxChars.value = String(maxChars); }
+  loadMaxChars();
+
+  svSaveMaxChars.addEventListener('click', () => {
+    const val = parseInt(svMaxChars.value, 10);
+    if (!Number.isFinite(val) || val < 1) { return; }
+    maxChars = val;
+    vscode.postMessage({ type: 'saveMaxChars', value: maxChars });
+    svMaxCharsSaved.style.display = 'inline';
+    setTimeout(() => { svMaxCharsSaved.style.display = 'none'; }, 1500);
+  });
+
+  svResetMaxChars.addEventListener('click', () => {
+    svMaxChars.value = String(DEFAULT_MAX_CHARS);
+  });
 
   // ── Preset select in chat ───────────────────────────────────────────────────
   function refreshPresetSelect() {
@@ -1184,13 +1635,23 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[]): stri
     if      (msg.type === 'response')       { waiting = false; btnSend.disabled = false; statusEl.textContent = ''; addMessage('assistant', msg.text, null); }
     else if (msg.type === 'addContext')     { addContext(msg.item); }
     else if (msg.type === 'modelChanged')   { setModel(msg.label); }
+    else if (msg.type === 'openSettings')   { showView('settings'); if (msg.section === 'filters') { document.getElementById('sv-extra-exts')?.scrollIntoView({ behavior: 'smooth', block: 'center' }); } }
     else if (msg.type === 'updateSettings') {
-      systemPrompt = msg.systemPrompt;
-      presets      = msg.presets;
+      systemPrompt   = msg.systemPrompt;
+      presets        = msg.presets;
+      blocklist      = msg.blocklist ?? [];
+      allowlist      = msg.allowlist ?? [];
+      extraTextExts  = msg.extraTextExts ?? [];
+      maxChars       = msg.maxChars ?? DEFAULT_MAX_CHARS;
+      filterProfiles = msg.filterProfiles ?? [];
+      respectIgnore  = msg.respectIgnore ?? true;
       loadSettingsPrompt();
       syncInfoSystemPrompt();
       renderPresetList();
       refreshPresetSelect();
+      loadFilters();
+      loadMaxChars();
+      renderFpList();
       if (previewOpen) { renderPreview(); }
     }
   });
