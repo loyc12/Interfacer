@@ -1,0 +1,13 @@
+Add a "copy all" button on each LLM response.
+
+Add a "add to context" toggle on each LLM response, to allow user to send back previous responses with the new prompt
+
+Add a "remember context files" option, on by default, to prevent selected files context from reseting after each prompt
+
+Format LLM responses so the stylistic notation generated is actually used, not just displayed raw
+
+Check why responses cut off arbitrarily after a set amount of character / tokens.
+
+Have responses be writen out while they are generated ( if possible ), and add a status bobber to indicate the LLM is still responding
+
+Check if we can automatically reuse the API key in workspaces, rather than having to set it up each time
