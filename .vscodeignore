@@ -1,0 +1,19 @@
+# Source and tooling — not needed at runtime
+src/
+.vscode/
+node_modules/
+.claude/
+out/test/
+
+# Build scripts — not needed at runtime
+install.sh
+uninstall.sh
+Makefile
+.gitignore
+.vscodeignore
+eslint.config.mjs
+tsconfig.json
+vsc-extension-quickstart.md
+CHANGELOG.md
+
+# Keep: out/extension.js, media/, package.json, README.md, CLAUDE.md

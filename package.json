@@ -1,5 +1,6 @@
 {
   "name": "interfacer",
+  "publisher": "interfacer",
   "displayName": "Interfacer",
   "description": "User-controlled LLM analysis panel for VS Code",
   "version": "0.1.0",
@@ -54,6 +55,10 @@
       {
         "command": "interfacer.addActiveFile",
         "title": "Add to Interfacer Context"
+      },
+      {
+        "command": "interfacer.addTerminalOutput",
+        "title": "Interfacer: Add Terminal Output to Context"
       }
     ],
     "configuration": {
@@ -73,6 +78,24 @@
           "type": "number",
           "default": 40000,
           "description": "Max characters of code context to send. Longer content is truncated."
+        },
+        "interfacer.systemPrompt": {
+          "type": "string",
+          "default": "",
+          "description": "System prompt sent with every request. Leave empty to use the built-in default. Edit in the ⚙ Settings panel."
+        },
+        "interfacer.promptPresets": {
+          "type": "array",
+          "default": [],
+          "description": "Named header presets appended to the system prompt per-message. Managed in the ⚙ Settings panel.",
+          "items": {
+            "type": "object",
+            "required": ["name", "content"],
+            "properties": {
+              "name":    { "type": "string", "description": "Display name for the preset" },
+              "content": { "type": "string", "description": "Instructions to append to the system prompt" }
+            }
+          }
         }
       }
     },
@@ -107,10 +130,11 @@
     "lint": "eslint src"
   },
   "devDependencies": {
-    "@types/vscode": "^1.116.0",
+    "@types/vscode": "^1.80.0",
     "@types/node": "22.x",
     "typescript-eslint": "^8.56.1",
     "eslint": "^9.39.3",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "@vscode/vsce": "^3.0.0"
   }
 }

@@ -15,7 +15,9 @@ When you add, remove, or rename **any** user-facing feature, go through this lis
 | 7 | Change to the system prompt | Update **System Prompt** section in info view |
 | 8 | New model added to `MODELS[]` | Update **Models** section in info view |
 | 9 | Behaviour change to an existing feature | Update the relevant description in the info view |
-| 10 | Any of the above | Re-read the full info view to check for stale text |
+| 10 | New or changed preset | Update `DEFAULT_PRESETS` array if it's a shipped default; remind user in CHANGELOG |
+| 11 | System prompt default changed | Update `DEFAULT_SYSTEM_PROMPT` constant AND the reset button target in `svResetPrompt` listener |
+| 12 | Any of the above | Re-read the full info view to check for stale text |
 
 The info view lives entirely inside `buildWebviewHtml()` in [src/extension.ts](src/extension.ts),
 in the `<div id="info-view">` block. It is plain HTML — edit it directly.

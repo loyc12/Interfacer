@@ -1,71 +1,54 @@
-# fresh-extension README
+# Interfacer
 
-This is the README for your extension "fresh-extension". After writing up a brief description, we recommend including the following sections.
+A user-controlled LLM analysis panel for VS Code.  
+Send code selections, files, and terminal output to Claude — nothing happens without your explicit action.
 
 ## Features
 
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
-
-For example if there is an image subfolder under your extension project workspace:
-
-\!\[feature X\]\(images/feature-x.png\)
-
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
+- **Chat panel** docked in the VS Code sidebar
+- **Attach context explicitly**: selected text, whole files, open tabs, or terminal output
+- **Header presets**: named instruction snippets selectable per-message
+- **Customisable system prompt** via the ⚙ Settings view
+- **Model switcher**: Haiku / Sonnet / Opus (status bar, one click)
+- **Payload preview**: see exactly what will be sent before you hit Send
+- **API key stored in OS keychain** — never written to settings.json
 
 ## Requirements
 
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
+- VS Code >= 1.80.0
+- An [Anthropic API key](https://console.anthropic.com)
 
-## Extension Settings
+## Setup
 
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
+1. Install the extension
+2. Open the Interfacer panel (robot icon in the activity bar)
+3. Click **🔑** and paste your Anthropic API key
+4. Select code → **Ctrl+Shift+I** (or right-click → *Interfacer: Send Selection to LLM*)
 
-For example:
+## Settings
 
-This extension contributes the following settings:
+| Setting | Default | Description |
+|---|---|---|
+| `interfacer.apiKey` | — | Plaintext fallback (prefer the keychain via 🔑) |
+| `interfacer.model` | `claude-haiku-4-5-20251001` | Active Claude model |
+| `interfacer.systemPrompt` | built-in | Base instruction sent with every request |
+| `interfacer.promptPresets` | `[]` | Named header presets (managed in ⚙ Settings) |
+| `interfacer.maxContextChars` | `40000` | Per-file character cap before truncation |
 
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
+## Building from source
 
-## Known Issues
+```bash
+./install.sh               # build + install into VS Code
+./install.sh --build-only  # produce interfacer.vsix without installing
+./uninstall.sh             # uninstall + clean build artefacts
+make help                  # see all Makefile targets
+```
 
-Calling out known issues can help limit users opening duplicate issues against your extension.
+Requires **Node.js >= 20**.
 
-## Release Notes
+## Design principles
 
-Users appreciate release notes as you update your extension.
-
-### 1.0.0
-
-Initial release of ...
-
-### 1.0.1
-
-Fixed issue #.
-
-### 1.1.0
-
-Added features X, Y, and Z.
-
----
-
-## Following extension guidelines
-
-Ensure that you've read through the extensions guidelines and follow the best practices for creating your extension.
-
-* [Extension Guidelines](https://code.visualstudio.com/api/references/extension-guidelines)
-
-## Working with Markdown
-
-You can author your README using Visual Studio Code. Here are some useful editor keyboard shortcuts:
-
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux).
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux).
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets.
-
-## For more information
-
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
-
-**Enjoy!**
+- No autonomous behaviour — every API call is user-triggered
+- No file editing — read-only with respect to your workspace
+- Context is always explicit — nothing is sent without you attaching it
+- Secrets never touch `settings.json` — API key lives in the OS keychain
