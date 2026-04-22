@@ -1,10 +1,10 @@
 {
-  "name": "fresh-extension",
-  "displayName": "fresh-extension",
-  "description": "",
-  "version": "0.0.1",
+  "name": "interfacer",
+  "displayName": "Interfacer",
+  "description": "User-controlled LLM analysis panel for VS Code",
+  "version": "0.1.0",
   "engines": {
-    "vscode": "^1.116.0"
+    "vscode": "^1.80.0"
   },
   "categories": [
     "Other"
@@ -12,29 +12,105 @@
   "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "interfacer",
+          "title": "Interfacer",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "interfacer": [
+        {
+          "type": "webview",
+          "id": "interfacer.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
     "commands": [
       {
-        "command": "fresh-extension.helloWorld",
-        "title": "Hello World"
+        "command": "interfacer.openChat",
+        "title": "Interfacer: Open Chat Panel"
+      },
+      {
+        "command": "interfacer.askLLM",
+        "title": "Interfacer: Send Selection to LLM"
+      },
+      {
+        "command": "interfacer.selectModel",
+        "title": "Interfacer: Switch Model"
+      },
+      {
+        "command": "interfacer.setApiKey",
+        "title": "Interfacer: Set API Key"
+      },
+      {
+        "command": "interfacer.addOpenFiles",
+        "title": "Interfacer: Add Open File(s) to Context"
+      },
+      {
+        "command": "interfacer.addActiveFile",
+        "title": "Add to Interfacer Context"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Interfacer",
+      "properties": {
+        "interfacer.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Anthropic API key. Falls back to ANTHROPIC_API_KEY env var."
+        },
+        "interfacer.model": {
+          "type": "string",
+          "default": "claude-haiku-4-5-20251001",
+          "description": "Claude model to use for analysis."
+        },
+        "interfacer.maxContextChars": {
+          "type": "number",
+          "default": 40000,
+          "description": "Max characters of code context to send. Longer content is truncated."
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "interfacer.askLLM",
+        "key": "ctrl+shift+i",
+        "mac": "cmd+shift+i",
+        "when": "editorTextFocus"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "interfacer.askLLM",
+          "group": "1_modification",
+          "when": "editorHasSelection"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "interfacer.addActiveFile",
+          "group": "navigation"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "pretest": "npm run compile && npm run lint",
-    "lint": "eslint src",
-    "test": "vscode-test"
+    "lint": "eslint src"
   },
   "devDependencies": {
     "@types/vscode": "^1.116.0",
-    "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
     "typescript-eslint": "^8.56.1",
     "eslint": "^9.39.3",
-    "typescript": "^5.9.3",
-    "@vscode/test-cli": "^0.0.12",
-    "@vscode/test-electron": "^2.5.2"
+    "typescript": "^5.9.3"
   }
 }
