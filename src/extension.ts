@@ -61,6 +61,13 @@ let secrets: vscode.SecretStorage;
 let statusBarItem: vscode.StatusBarItem;
 let provider: InterfacerViewProvider;
 
+// Active streaming request — destroyed on user stop
+let activeReq: ReturnType<typeof https.request> | null = null;
+let userStopped = false;   // distinguishes user abort from network error
+// Saved params from the last callLLM invocation, used for continuation requests
+let lastCallSysPrompt = '';
+let lastCallUserContent = '';
+
 // ─── Sidebar view provider ────────────────────────────────────────────────────
 
 class InterfacerViewProvider implements vscode.WebviewViewProvider {
@@ -83,21 +90,32 @@ class InterfacerViewProvider implements vscode.WebviewViewProvider {
 		const initBlocklist      = config.get<string[]>('fileBlocklist') ?? [];
 		const initAllowlist      = config.get<string[]>('fileAllowlist') ?? [];
 		const initExtraExts      = config.get<string[]>('extraTextExtensions') ?? [];
-		const initMaxChars       = config.get<number>('maxContextChars') ?? 40000;
-		const initFilterProfiles = config.get<FilterProfile[]>('filterProfiles') ?? [];
-		const initRespectIgnore  = config.get<boolean>('respectIgnoreFiles') ?? true;
+		const initMaxChars        = config.get<number>('maxContextChars') ?? 40000;
+		const initMaxOutputTokens = config.get<number>('maxOutputTokens') ?? 8192;
+		const initFilterProfiles  = config.get<FilterProfile[]>('filterProfiles') ?? [];
+		const initRespectIgnore   = config.get<boolean>('respectIgnoreFiles') ?? true;
 
-		webviewView.webview.html = buildWebviewHtml(initSystemPrompt, initPresets, initBlocklist, initAllowlist, initExtraExts, initMaxChars, initFilterProfiles, initRespectIgnore);
+		webviewView.webview.html = buildWebviewHtml(initSystemPrompt, initPresets, initBlocklist, initAllowlist, initExtraExts, initMaxChars, initMaxOutputTokens, initFilterProfiles, initRespectIgnore);
 
 		webviewView.webview.onDidReceiveMessage(async (msg) => {
 			switch (msg.type) {
 				case 'send': {
-					const text = await callLLM(
+					callLLM(
 						msg.prompt as string,
 						msg.contexts as ContextItem[],
 						msg.preset as string | undefined
 					);
-					this.post({ type: 'response', text });
+					break;
+				}
+				case 'stopGeneration': {
+					if (activeReq) {
+						userStopped = true;
+						activeReq.destroy();
+					}
+					break;
+				}
+				case 'continueGeneration': {
+					continueGeneration(msg.accumulatedText as string);
 					break;
 				}
 				case 'getSelection':    await injectSelectionContext(); break;
@@ -141,6 +159,14 @@ class InterfacerViewProvider implements vscode.WebviewViewProvider {
 					}
 					break;
 				}
+				case 'saveMaxOutputTokens': {
+					const cfg = vscode.workspace.getConfiguration('interfacer');
+					const val = Number(msg.value);
+					if (Number.isFinite(val) && val > 0) {
+						await cfg.update('maxOutputTokens', val, vscode.ConfigurationTarget.Global);
+					}
+					break;
+				}
 			}
 		}, null, this.context.subscriptions);
 	}
@@ -159,6 +185,7 @@ class InterfacerViewProvider implements vscode.WebviewViewProvider {
 			allowlist:        config.get<string[]>('fileAllowlist') ?? [],
 			extraTextExts:    config.get<string[]>('extraTextExtensions') ?? [],
 			maxChars:         config.get<number>('maxContextChars') ?? 40000,
+			maxOutputTokens:  config.get<number>('maxOutputTokens') ?? 8192,
 			filterProfiles:   config.get<FilterProfile[]>('filterProfiles') ?? [],
 			respectIgnore:    config.get<boolean>('respectIgnoreFiles') ?? true,
 		});
@@ -201,6 +228,7 @@ export function activate(context: vscode.ExtensionContext) {
 			    e.affectsConfiguration('interfacer.fileAllowlist') ||
 			    e.affectsConfiguration('interfacer.extraTextExtensions') ||
 			    e.affectsConfiguration('interfacer.maxContextChars') ||
+			    e.affectsConfiguration('interfacer.maxOutputTokens') ||
 			    e.affectsConfiguration('interfacer.filterProfiles') ||
 			    e.affectsConfiguration('interfacer.respectIgnoreFiles')) {
 				provider.sendSettings();
@@ -647,18 +675,21 @@ async function addUriToContext(uri: vscode.Uri) {
 
 // ─── LLM call ─────────────────────────────────────────────────────────────────
 
-async function callLLM(prompt: string, contexts: ContextItem[], preset?: string): Promise<string> {
+function callLLM(prompt: string, contexts: ContextItem[], preset?: string): void {
+	(async () => {
 	const config   = vscode.workspace.getConfiguration('interfacer');
 	const apiKey   =
 		(await secrets.get(SECRET_KEY)) ||
 		config.get<string>('apiKey') ||
 		process.env.ANTHROPIC_API_KEY || '';
-	const model    = config.get<string>('model') || MODELS[0].id;
-	const baseSys  = config.get<string>('systemPrompt') || DEFAULT_SYSTEM_PROMPT;
+	const model      = config.get<string>('model') || MODELS[0].id;
+	const maxTokens  = config.get<number>('maxOutputTokens') ?? 8192;
+	const baseSys    = config.get<string>('systemPrompt') || DEFAULT_SYSTEM_PROMPT;
 	const systemPrompt = preset ? baseSys + '\n\n' + preset : baseSys;
 
 	if (!apiKey) {
-		return 'No API key configured.\nClick 🔑 or run the command Interfacer: Set API Key.';
+		provider.post({ type: 'responseError', text: 'No API key configured. Click 🔑 or run Interfacer: Set API Key.' });
+		return;
 	}
 
 	let userContent = '';
@@ -669,39 +700,149 @@ async function callLLM(prompt: string, contexts: ContextItem[], preset?: string)
 	}
 	userContent += prompt;
 
+	// Save for potential continuation request
+	lastCallSysPrompt    = systemPrompt;
+	lastCallUserContent  = userContent;
+
+	streamRequest(apiKey, systemPrompt, [{ role: 'user', content: userContent }], model, maxTokens);
+	})();
+}
+
+function continueGeneration(accumulatedText: string): void {
+	(async () => {
+	const config  = vscode.workspace.getConfiguration('interfacer');
+	const apiKey  =
+		(await secrets.get(SECRET_KEY)) ||
+		config.get<string>('apiKey') ||
+		process.env.ANTHROPIC_API_KEY || '';
+	const model      = config.get<string>('model') || MODELS[0].id;
+	const maxTokens  = config.get<number>('maxOutputTokens') ?? 8192;
+
+	streamRequest(apiKey, lastCallSysPrompt, [
+		{ role: 'user',      content: lastCallUserContent },
+		{ role: 'assistant', content: accumulatedText },
+		{ role: 'user',      content: 'Please continue.' },
+	], model, maxTokens);
+	})();
+}
+
+function streamRequest(
+	apiKey: string,
+	systemPrompt: string,
+	messages: { role: string; content: string }[],
+	model: string,
+	maxTokens: number,
+): void {
 	const body = JSON.stringify({
-		model, max_tokens: 1024, system: systemPrompt,
-		messages: [{ role: 'user', content: userContent }],
+		model, max_tokens: maxTokens, stream: true, system: systemPrompt, messages,
 	});
 
-	return new Promise((resolve) => {
-		const req = https.request(
-			{
-				hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
-				headers: {
-					'Content-Type': 'application/json',
-					'x-api-key': apiKey,
-					'anthropic-version': '2023-06-01',
-					'Content-Length': Buffer.byteLength(body),
-				},
+	// Shared across the response callback and req.on('error') to prevent double-posting.
+	let finished = false;
+	let hitMaxTokens = false;
+
+	const req = https.request(
+		{
+			hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'Accept': 'text/event-stream',
+				'x-api-key': apiKey,
+				'anthropic-version': '2023-06-01',
+				'Content-Length': Buffer.byteLength(body),
 			},
-			(res) => {
+		},
+		(res) => {
+			// Non-200 responses come back as plain JSON (auth errors, rate limits, etc.)
+			if (res.statusCode !== 200) {
 				let raw = '';
-				res.on('data', (chunk) => { raw += chunk; });
+				res.on('data', (chunk: Buffer) => { raw += chunk.toString(); });
 				res.on('end', () => {
+					if (finished) { return; }
+					finished = true; activeReq = null;
 					try {
 						const parsed = JSON.parse(raw);
-						if (parsed.content?.[0]?.text) { resolve(parsed.content[0].text as string); }
-						else if (parsed.error)         { resolve(`API error: ${parsed.error.message}`); }
-						else                           { resolve('Unexpected response:\n' + raw.slice(0, 300)); }
-					} catch { resolve('Failed to parse API response:\n' + raw.slice(0, 300)); }
+						provider.post({ type: 'responseError', text: `API error (${res.statusCode}): ${parsed.error?.message ?? raw.slice(0, 300)}` });
+					} catch { provider.post({ type: 'responseError', text: `API error (${res.statusCode}): ${raw.slice(0, 300)}` }); }
 				});
+				return;
 			}
-		);
-		req.on('error', (e: Error) => resolve(`Request failed: ${e.message}`));
-		req.write(body);
-		req.end();
+
+			let buf = '';
+
+			res.on('data', (chunk: Buffer) => {
+				buf += chunk.toString();
+				let boundary: number;
+				while ((boundary = buf.indexOf('\n\n')) !== -1) {
+					const block = buf.slice(0, boundary);
+					buf = buf.slice(boundary + 2);
+
+					let evtType = '';
+					let evtData = '';
+					for (const line of block.split('\n')) {
+						if (line.startsWith('event: ')) { evtType = line.slice(7).trim(); }
+						else if (line.startsWith('data: ')) { evtData = line.slice(6); }
+					}
+
+					if (evtType === 'content_block_delta') {
+						try {
+							const p = JSON.parse(evtData);
+							if (p.delta?.type === 'text_delta' && p.delta.text) {
+								provider.post({ type: 'chunk', text: p.delta.text as string });
+							}
+						} catch { /* ignore malformed event */ }
+					} else if (evtType === 'message_delta') {
+						try {
+							const p = JSON.parse(evtData);
+							if (p.delta?.stop_reason === 'max_tokens') { hitMaxTokens = true; }
+						} catch { /* ignore */ }
+					} else if (evtType === 'message_stop') {
+						finished = true;
+						activeReq = null;
+						if (hitMaxTokens) {
+							provider.post({ type: 'maxTokensReached' });
+						} else {
+							provider.post({ type: 'responseEnd' });
+						}
+					} else if (evtType === 'error') {
+						finished = true;
+						activeReq = null;
+						try {
+							const p = JSON.parse(evtData);
+							provider.post({ type: 'responseError', text: `API error: ${p.error?.message ?? evtData}` });
+						} catch { provider.post({ type: 'responseError', text: `API error: ${evtData}` }); }
+					}
+				}
+			});
+
+			res.on('end', () => {
+				if (finished) { activeReq = null; return; }
+				finished = true; activeReq = null;
+				if (userStopped) { userStopped = false; }
+				provider.post({ type: 'responseEnd' });
+			});
+			// req.destroy() mid-stream emits 'error' on res, not on req — handle it here.
+			res.on('error', () => {
+				if (finished) { return; }
+				finished = true; activeReq = null;
+				if (userStopped) { userStopped = false; }
+				provider.post({ type: 'responseEnd' });
+			});
+		}
+	);
+	activeReq = req;
+	req.on('error', (e: Error) => {
+		if (finished) { activeReq = null; return; }
+		finished = true; activeReq = null;
+		if (userStopped) {
+			userStopped = false;
+			provider.post({ type: 'responseEnd' });
+		} else {
+			provider.post({ type: 'responseError', text: `Request failed: ${e.message}` });
+		}
 	});
+	req.write(body);
+	req.end();
 }
 
 // ─── Status bar ───────────────────────────────────────────────────────────────
@@ -715,19 +856,20 @@ function refreshStatusBar() {
 
 // ─── Webview HTML ─────────────────────────────────────────────────────────────
 
-function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initBlocklist: string[], initAllowlist: string[], initExtraExts: string[], initMaxChars: number, initFilterProfiles: FilterProfile[], initRespectIgnore: boolean): string {
+function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initBlocklist: string[], initAllowlist: string[], initExtraExts: string[], initMaxChars: number, initMaxOutputTokens: number, initFilterProfiles: FilterProfile[], initRespectIgnore: boolean): string {
 	const nonce = crypto.randomBytes(16).toString('hex');
 
 	// Safely embed JS values
-	const jsSystemPrompt    = JSON.stringify(initSystemPrompt);
-	const jsPresets         = JSON.stringify(initPresets);
-	const jsDefaultSys      = JSON.stringify(DEFAULT_SYSTEM_PROMPT);
-	const jsBlocklist       = JSON.stringify(initBlocklist);
-	const jsAllowlist       = JSON.stringify(initAllowlist);
-	const jsExtraExts       = JSON.stringify(initExtraExts);
-	const jsMaxChars        = JSON.stringify(initMaxChars);
-	const jsFilterProfiles  = JSON.stringify(initFilterProfiles);
-	const jsRespectIgnore   = JSON.stringify(initRespectIgnore);
+	const jsSystemPrompt      = JSON.stringify(initSystemPrompt);
+	const jsPresets           = JSON.stringify(initPresets);
+	const jsDefaultSys        = JSON.stringify(DEFAULT_SYSTEM_PROMPT);
+	const jsBlocklist         = JSON.stringify(initBlocklist);
+	const jsAllowlist         = JSON.stringify(initAllowlist);
+	const jsExtraExts         = JSON.stringify(initExtraExts);
+	const jsMaxChars          = JSON.stringify(initMaxChars);
+	const jsMaxOutputTokens   = JSON.stringify(initMaxOutputTokens);
+	const jsFilterProfiles    = JSON.stringify(initFilterProfiles);
+	const jsRespectIgnore     = JSON.stringify(initRespectIgnore);
 
 	return /* html */`<!DOCTYPE html>
 <html lang="en">
@@ -766,6 +908,15 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
   .tool-btn.ghost:hover { background: var(--vscode-toolbar-hoverBackground); }
   .tool-btn:disabled  { opacity: 0.45; cursor: default; }
   .tool-btn.active    { color: var(--vscode-textLink-foreground); }
+  /* Keep-context toggle gets a stronger visual treatment */
+  #btn-keep-ctx.active { background: var(--vscode-toolbar-activeBackground, rgba(0,120,215,0.12)); border-color: var(--vscode-textLink-foreground); color: var(--vscode-textLink-foreground); }
+  #btn-keep-ctx:not(.active) { opacity: 0.5; }
+  /* Stop button — shown only while waiting */
+  #btn-stop { display: none; }
+  #btn-stop.visible { display: inline-flex; color: var(--vscode-errorForeground, #f44); }
+  /* Continue/Done prompt inside a streaming message */
+  .max-tokens-prompt { display: flex; gap: 6px; align-items: center; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--vscode-widget-border, #444); font-size: 0.82em; }
+  .max-tokens-prompt span { opacity: 0.65; flex: 1; }
 
   /* back bar (shown at top of info / settings views) */
   .back-bar {
@@ -794,10 +945,35 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
 
   /* log */
   #log { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 10px; }
-  .msg { white-space: pre-wrap; word-break: break-word; padding: 6px 10px; border-radius: 3px; line-height: 1.5; }
+  .msg { word-break: break-word; padding: 6px 10px; border-radius: 3px; line-height: 1.5; }
   .msg-label { font-size: 0.72em; opacity: 0.5; margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.04em; }
-  .msg.user      { background: var(--vscode-input-background); border-left: 2px solid var(--vscode-focusBorder); }
+  .msg.user      { white-space: pre-wrap; background: var(--vscode-input-background); border-left: 2px solid var(--vscode-focusBorder); }
   .msg.assistant { background: var(--vscode-editor-inactiveSelectionBackground); border-left: 2px solid var(--vscode-textLink-foreground); }
+  /* Markdown rendering inside assistant messages */
+  .msg-body { line-height: 1.6; }
+  .msg-body p  { margin: 0.35em 0; }
+  .msg-body h1 { font-size: 1.15em; font-weight: 700; margin: 0.6em 0 0.2em; }
+  .msg-body h2 { font-size: 1.05em; font-weight: 700; margin: 0.5em 0 0.15em; }
+  .msg-body h3 { font-size: 0.95em; font-weight: 700; margin: 0.4em 0 0.1em; }
+  .msg-body pre { background: var(--vscode-textCodeBlock-background, rgba(128,128,128,0.15)); border-radius: 3px; padding: 6px 8px; overflow-x: auto; margin: 0.4em 0; font-size: 0.88em; white-space: pre; }
+  .msg-body code { font-family: var(--vscode-editor-font-family, monospace); font-size: 0.9em; background: var(--vscode-textCodeBlock-background, rgba(128,128,128,0.15)); padding: 1px 4px; border-radius: 2px; }
+  .msg-body pre code { background: none; padding: 0; font-size: 1em; }
+  .msg-body ul, .msg-body ol { padding-left: 1.4em; margin: 0.3em 0; }
+  .msg-body li { margin: 0.1em 0; }
+  .msg-body hr { border: none; border-top: 1px solid var(--vscode-widget-border, #444); margin: 0.6em 0; }
+  .msg-body blockquote { border-left: 3px solid var(--vscode-widget-border, #555); margin: 0.3em 0; padding: 0 0.6em; opacity: 0.8; }
+  .msg-body strong { font-weight: 700; }
+  .msg-body em { font-style: italic; }
+  /* Message action buttons (copy, add-to-context) */
+  .msg-actions { display: flex; gap: 4px; margin-top: 5px; }
+  .msg-act-btn { background: none; border: none; cursor: pointer; padding: 2px 5px; border-radius: 2px; font-size: 0.78em; opacity: 0.45; color: var(--vscode-foreground); font-family: inherit; }
+  .msg-act-btn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
+  /* Streaming cursor */
+  .stream-cursor { display: inline-block; width: 7px; height: 0.85em; background: var(--vscode-foreground); opacity: 0.6; animation: blink 1s step-end infinite; vertical-align: text-bottom; margin-left: 1px; }
+  @keyframes blink { 0%, 100% { opacity: 0.6; } 50% { opacity: 0; } }
+  /* Spinner in status bar */
+  .spin { display: inline-block; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   /* input area */
   #input-area {
@@ -907,6 +1083,7 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
   <button class="tool-btn secondary" id="btn-open"      title="Choose from currently open files">📋 Open Files</button>
   <button class="tool-btn secondary" id="btn-file"      title="Pick files from disk">📂 Browse…</button>
   <button class="tool-btn secondary" id="btn-terminal"  title="Capture last N lines from a terminal">⬡ Terminal</button>
+  <button class="tool-btn ghost active" id="btn-keep-ctx" title="Keep context items after sending (click to toggle)">📎</button>
   <div class="tb-spacer"></div>
   <button class="tool-btn ghost" id="btn-model"    title="Switch model"></button>
   <button class="tool-btn ghost" id="btn-apikey"   title="Set API key">🔑</button>
@@ -954,6 +1131,7 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
     <textarea id="prompt" placeholder="Ask about the code…" rows="3"></textarea>
     <div id="send-row">
       <button class="tool-btn primary" id="btn-send">Send</button>
+      <button class="tool-btn ghost" id="btn-stop" title="Stop generation">⏹ Stop</button>
       <span id="status"></span>
       <span id="model-label"></span>
     </div>
@@ -1136,15 +1314,24 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
   </div>
 
   <div class="sv-section">
-    <div class="sv-heading">Context Limits</div>
-    <div class="sv-desc">Per-file character cap. Files longer than this limit are truncated and labelled "— truncated" when added to context.</div>
-    <div class="sv-form-label">Max characters per file</div>
+    <div class="sv-heading">Limits</div>
+    <div class="sv-form-label">Max characters per context file</div>
+    <div class="sv-desc" style="margin-bottom:4px;">Files longer than this are truncated when added to context.</div>
     <input type="number" id="sv-max-chars" class="sv-input" min="1000" max="2000000" step="1000" style="width:140px;" />
-    <div class="sv-btn-row" style="margin-top:6px;">
-      <button class="tool-btn ghost" id="sv-reset-maxchars">Reset to default (40,000)</button>
+    <div class="sv-btn-row" style="margin-top:4px;">
+      <button class="tool-btn ghost" id="sv-reset-maxchars">Reset (40,000)</button>
       <div class="spacer"></div>
       <span class="sv-saved-notice" id="sv-maxchars-saved" style="display:none;">Saved.</span>
       <button class="tool-btn primary" id="sv-save-maxchars">Save</button>
+    </div>
+    <div class="sv-form-label" style="margin-top:10px;">Max output tokens per response</div>
+    <div class="sv-desc" style="margin-bottom:4px;">When reached, you will be prompted to Continue or stop. Supported range: 1–8192 for most models.</div>
+    <input type="number" id="sv-max-out-tokens" class="sv-input" min="256" max="8192" step="256" style="width:140px;" />
+    <div class="sv-btn-row" style="margin-top:4px;">
+      <button class="tool-btn ghost" id="sv-reset-max-out-tokens">Reset (8,192)</button>
+      <div class="spacer"></div>
+      <span class="sv-saved-notice" id="sv-max-out-tokens-saved" style="display:none;">Saved.</span>
+      <button class="tool-btn primary" id="sv-save-max-out-tokens">Save</button>
     </div>
   </div>
 
@@ -1173,6 +1360,8 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
   const btnSettings   = document.getElementById('btn-settings');
   const btnInfo       = document.getElementById('btn-info');
   const btnClrAllCtx  = document.getElementById('btn-clr-all-ctx');
+  const btnKeepCtx    = document.getElementById('btn-keep-ctx');
+  const btnStop       = document.getElementById('btn-stop');
   const btnPreview    = document.getElementById('btn-preview');
   const previewPanel  = document.getElementById('preview-panel');
   const pvSystem      = document.getElementById('pv-system');
@@ -1221,17 +1410,22 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
   let contexts     = [];
   let nextId       = 0;
   let editingIndex = -1;  // -1 = adding new preset
+  let keepCtx      = true;
+  let streamMsgDiv = null;  // current streaming message wrapper
+  let streamBuf    = '';    // accumulated raw text for the current stream
 
   let systemPrompt   = ${jsSystemPrompt};
   let presets        = ${jsPresets};
   let blocklist      = ${jsBlocklist};
   let allowlist      = ${jsAllowlist};
   let extraTextExts  = ${jsExtraExts};
-  let maxChars       = ${jsMaxChars};
-  let filterProfiles = ${jsFilterProfiles};
-  let respectIgnore  = ${jsRespectIgnore};
-  const DEFAULT_SYSTEM_PROMPT = ${jsDefaultSys};
-  const DEFAULT_MAX_CHARS = 40000;
+  let maxChars         = ${jsMaxChars};
+  let maxOutputTokens  = ${jsMaxOutputTokens};
+  let filterProfiles   = ${jsFilterProfiles};
+  let respectIgnore    = ${jsRespectIgnore};
+  const DEFAULT_SYSTEM_PROMPT   = ${jsDefaultSys};
+  const DEFAULT_MAX_CHARS       = 40000;
+  const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
 
   // ── View switching ──────────────────────────────────────────────────────────
   function showView(v) {
@@ -1452,8 +1646,16 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
     vscode.postMessage({ type: 'saveFilterProfiles', profiles: filterProfiles });
   }
 
-  // ── Settings view — context limits ──────────────────────────────────────────
-  function loadMaxChars() { svMaxChars.value = String(maxChars); }
+  // ── Settings view — limits ──────────────────────────────────────────────────
+  const svMaxOutTokens      = document.getElementById('sv-max-out-tokens');
+  const svSaveMaxOutTokens  = document.getElementById('sv-save-max-out-tokens');
+  const svResetMaxOutTokens = document.getElementById('sv-reset-max-out-tokens');
+  const svMaxOutTokensSaved = document.getElementById('sv-max-out-tokens-saved');
+
+  function loadMaxChars() {
+    svMaxChars.value    = String(maxChars);
+    svMaxOutTokens.value = String(maxOutputTokens);
+  }
   loadMaxChars();
 
   svSaveMaxChars.addEventListener('click', () => {
@@ -1464,10 +1666,17 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
     svMaxCharsSaved.style.display = 'inline';
     setTimeout(() => { svMaxCharsSaved.style.display = 'none'; }, 1500);
   });
+  svResetMaxChars.addEventListener('click', () => { svMaxChars.value = String(DEFAULT_MAX_CHARS); });
 
-  svResetMaxChars.addEventListener('click', () => {
-    svMaxChars.value = String(DEFAULT_MAX_CHARS);
+  svSaveMaxOutTokens.addEventListener('click', () => {
+    const val = parseInt(svMaxOutTokens.value, 10);
+    if (!Number.isFinite(val) || val < 1) { return; }
+    maxOutputTokens = val;
+    vscode.postMessage({ type: 'saveMaxOutputTokens', value: maxOutputTokens });
+    svMaxOutTokensSaved.style.display = 'inline';
+    setTimeout(() => { svMaxOutTokensSaved.style.display = 'none'; }, 1500);
   });
+  svResetMaxOutTokens.addEventListener('click', () => { svMaxOutTokens.value = String(DEFAULT_MAX_OUTPUT_TOKENS); });
 
   // ── Preset select in chat ───────────────────────────────────────────────────
   function refreshPresetSelect() {
@@ -1576,6 +1785,8 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
     if (waiting) { return; }
     const prompt = promptEl.value.trim();
     if (!prompt) { return; }
+    // Defensive: ensure streaming state is clean before each send.
+    streamMsgDiv = null; streamBuf = '';
 
     const snapshot = contexts.slice();
     const preset   = selectedPreset();
@@ -1586,11 +1797,12 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
 
     addMessage('user', prompt, ctxSummary);
     promptEl.value = '';
-    clearAllContexts();
+    if (!keepCtx) { clearAllContexts(); }
 
     waiting = true;
     btnSend.disabled = true;
-    statusEl.textContent = 'Waiting…';
+    btnStop.classList.add('visible');
+    statusEl.innerHTML = '<span class="spin">↻</span> Responding…';
 
     vscode.postMessage({
       type: 'send', prompt,
@@ -1608,9 +1820,81 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
     lbl.textContent = (role === 'user' ? 'You' : 'Assistant') + (ctxSummary ? ' · ' + ctxSummary : '');
     wrapper.appendChild(lbl);
     const body = document.createElement('div');
-    body.textContent = text;
+    body.className = 'msg-body';
+    if (role === 'assistant') {
+      body.innerHTML = renderMarkdown(text);
+      const actions = document.createElement('div');
+      actions.className = 'msg-actions';
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'msg-act-btn';
+      copyBtn.title = 'Copy response';
+      copyBtn.textContent = '⧉ Copy';
+      copyBtn.addEventListener('click', () => navigator.clipboard.writeText(text).catch(() => {}));
+      const ctxBtn = document.createElement('button');
+      ctxBtn.className = 'msg-act-btn';
+      ctxBtn.title = 'Add this response to context';
+      ctxBtn.textContent = '↙ Add to context';
+      ctxBtn.addEventListener('click', () => {
+        addContext({ label: 'Response', content: text, kind: 'text' });
+        ctxBtn.textContent = '✔ Added';
+        ctxBtn.disabled = true;
+      });
+      actions.appendChild(copyBtn);
+      actions.appendChild(ctxBtn);
+      wrapper.appendChild(body);
+      wrapper.appendChild(actions);
+    } else {
+      body.textContent = text;
+      wrapper.appendChild(body);
+    }
+    logEl.appendChild(wrapper);
+    logEl.scrollTop = logEl.scrollHeight;
+    return wrapper;
+  }
+
+  // Creates a streaming message placeholder and returns it.
+  // The cursor is a real DOM node (not embedded in innerHTML) so it can be removed explicitly.
+  function startStreamingMessage() {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'msg assistant';
+    const lbl = document.createElement('div');
+    lbl.className = 'msg-label';
+    lbl.textContent = 'Assistant';
+    wrapper.appendChild(lbl);
+    const body = document.createElement('div');
+    body.className = 'msg-body';
+    const streamText = document.createElement('span');
+    body.appendChild(streamText);
+    const cursor = document.createElement('span');
+    cursor.className = 'stream-cursor';
+    body.appendChild(cursor);
     wrapper.appendChild(body);
     logEl.appendChild(wrapper);
+    logEl.scrollTop = logEl.scrollHeight;
+    return { wrapper, body, streamText, cursor };
+  }
+
+  function finalizeStreamingMessage(wrapper, body, rawText) {
+    body.innerHTML = renderMarkdown(rawText);
+    const actions = document.createElement('div');
+    actions.className = 'msg-actions';
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'msg-act-btn';
+    copyBtn.title = 'Copy response';
+    copyBtn.textContent = '⧉ Copy';
+    copyBtn.addEventListener('click', () => navigator.clipboard.writeText(rawText).catch(() => {}));
+    const ctxBtn = document.createElement('button');
+    ctxBtn.className = 'msg-act-btn';
+    ctxBtn.title = 'Add this response to context';
+    ctxBtn.textContent = '↙ Add to context';
+    ctxBtn.addEventListener('click', () => {
+      addContext({ label: 'Response', content: rawText, kind: 'text' });
+      ctxBtn.textContent = '✔ Added';
+      ctxBtn.disabled = true;
+    });
+    actions.appendChild(copyBtn);
+    actions.appendChild(ctxBtn);
+    wrapper.appendChild(actions);
     logEl.scrollTop = logEl.scrollHeight;
   }
 
@@ -1624,6 +1908,18 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
   btnApiKey.addEventListener('click',    () => vscode.postMessage({ type: 'setApiKey' }));
   btnClrLog.addEventListener('click',    () => { logEl.innerHTML = ''; });
   btnClrAllCtx.addEventListener('click', clearAllContexts);
+  btnKeepCtx.addEventListener('click', () => {
+    keepCtx = !keepCtx;
+    btnKeepCtx.classList.toggle('active', keepCtx);
+    btnKeepCtx.title = keepCtx
+      ? 'Keep context items after sending (click to toggle)'
+      : 'Context clears after each send (click to toggle)';
+  });
+  btnStop.addEventListener('click', () => {
+    vscode.postMessage({ type: 'stopGeneration' });
+    btnStop.classList.remove('visible');
+    statusEl.textContent = 'Stopping…';
+  });
 
   promptEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
@@ -1632,7 +1928,67 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
   // ── Messages from extension ──────────────────────────────────────────────────
   window.addEventListener('message', (e) => {
     const msg = e.data;
-    if      (msg.type === 'response')       { waiting = false; btnSend.disabled = false; statusEl.textContent = ''; addMessage('assistant', msg.text, null); }
+    if (msg.type === 'chunk') {
+      if (!streamMsgDiv) { const els = startStreamingMessage(); streamMsgDiv = els; }
+      streamBuf += msg.text;
+      // Show raw text while streaming (fast, cursor stays visible)
+      streamMsgDiv.body.innerHTML = escHtml(streamBuf) + '<span class="stream-cursor"></span>';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    else if (msg.type === 'responseEnd') {
+      waiting = false; btnSend.disabled = false; btnStop.classList.remove('visible'); statusEl.textContent = '';
+      // Capture and clear state before finalize — ensures cleanup even if finalize throws.
+      const _div = streamMsgDiv; const _buf = streamBuf;
+      streamMsgDiv = null; streamBuf = '';
+      if (_div) { try { finalizeStreamingMessage(_div.wrapper, _div.body, _buf); } catch(e) { console.error('[Interfacer] finalize error:', e); } }
+    }
+    else if (msg.type === 'maxTokensReached') {
+      // Keep waiting=true — don't re-enable Send until user decides
+      btnStop.classList.remove('visible');
+      statusEl.textContent = '';
+      if (streamMsgDiv) {
+        // Capture and clear outer state immediately — Continue/Done use closures.
+        const savedBuf = streamBuf;
+        const savedDiv = streamMsgDiv;
+        streamMsgDiv = null; streamBuf = '';
+        // Render what we have so far, then add Continue/Done prompt
+        savedDiv.body.innerHTML = renderMarkdown(savedBuf);
+        const prompt = document.createElement('div');
+        prompt.className = 'max-tokens-prompt';
+        prompt.innerHTML = '<span>Response limit reached.</span>';
+        const contBtn = document.createElement('button');
+        contBtn.className = 'msg-act-btn';
+        contBtn.textContent = '▶ Continue';
+        const doneBtn = document.createElement('button');
+        doneBtn.className = 'msg-act-btn';
+        doneBtn.textContent = '✓ Done';
+        prompt.appendChild(contBtn);
+        prompt.appendChild(doneBtn);
+        savedDiv.wrapper.appendChild(prompt);
+        logEl.scrollTop = logEl.scrollHeight;
+        contBtn.addEventListener('click', () => {
+          prompt.remove();
+          // Re-enter streaming state using the saved references.
+          streamBuf = savedBuf; streamMsgDiv = savedDiv;
+          savedDiv.body.innerHTML = renderMarkdown(savedBuf) + '<span class="stream-cursor"></span>';
+          btnSend.disabled = true; btnStop.classList.add('visible');
+          statusEl.innerHTML = '<span class="spin">↻</span> Responding…';
+          vscode.postMessage({ type: 'continueGeneration', accumulatedText: savedBuf });
+        });
+        doneBtn.addEventListener('click', () => {
+          prompt.remove();
+          try { finalizeStreamingMessage(savedDiv.wrapper, savedDiv.body, savedBuf); } catch(e) { console.error('[Interfacer] finalize error:', e); }
+          streamMsgDiv = null; streamBuf = '';
+          waiting = false; btnSend.disabled = false;
+        });
+      }
+    }
+    else if (msg.type === 'responseError') {
+      waiting = false; btnSend.disabled = false; btnStop.classList.remove('visible'); statusEl.textContent = '';
+      if (streamMsgDiv) { streamMsgDiv.body.innerHTML = '<em style="opacity:0.6">' + escHtml(msg.text) + '</em>'; }
+      else              { addMessage('assistant', msg.text, null); }
+      streamMsgDiv = null; streamBuf = '';
+    }
     else if (msg.type === 'addContext')     { addContext(msg.item); }
     else if (msg.type === 'modelChanged')   { setModel(msg.label); }
     else if (msg.type === 'openSettings')   { showView('settings'); if (msg.section === 'filters') { document.getElementById('sv-extra-exts')?.scrollIntoView({ behavior: 'smooth', block: 'center' }); } }
@@ -1642,9 +1998,10 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
       blocklist      = msg.blocklist ?? [];
       allowlist      = msg.allowlist ?? [];
       extraTextExts  = msg.extraTextExts ?? [];
-      maxChars       = msg.maxChars ?? DEFAULT_MAX_CHARS;
-      filterProfiles = msg.filterProfiles ?? [];
-      respectIgnore  = msg.respectIgnore ?? true;
+      maxChars        = msg.maxChars ?? DEFAULT_MAX_CHARS;
+      maxOutputTokens = msg.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+      filterProfiles  = msg.filterProfiles ?? [];
+      respectIgnore   = msg.respectIgnore ?? true;
       loadSettingsPrompt();
       syncInfoSystemPrompt();
       renderPresetList();
@@ -1663,6 +2020,81 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
   // ── Utils ────────────────────────────────────────────────────────────────────
   function escHtml(s) {
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // Backtick is char code 96 — avoids putting a raw backtick inside the TS template literal
+  const _BT = String.fromCharCode(96);
+  const _inlineCodeRe = new RegExp(_BT + '([^' + _BT + ']+)' + _BT, 'g');
+  function _isFence(line) {
+    return line.length >= 3 && line.charCodeAt(0) === 96 && line.charCodeAt(1) === 96 && line.charCodeAt(2) === 96;
+  }
+
+  function inlineMd(s) {
+    s = escHtml(s);
+    s = s.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
+    s = s.replace(/\*\*(.+?)\*\*/g,     '<strong>$1</strong>');
+    s = s.replace(/\*(.+?)\*/g,         '<em>$1</em>');
+    s = s.replace(/_(.+?)_/g,           '<em>$1</em>');
+    s = s.replace(_inlineCodeRe,        '<code>$1</code>');
+    return s;
+  }
+
+  function renderMarkdown(text) {
+    const lines = text.split('\\n');
+    let html = '';
+    let inCode = false;
+    let codeLang = '';
+    let codeBuf = '';
+    let inList = false;
+    let listTag = 'ul';
+
+    for (const line of lines) {
+      if (_isFence(line)) {
+        if (!inCode) {
+          if (inList) { html += '</' + listTag + '>'; inList = false; }
+          inCode = true; codeLang = line.slice(3).trim(); codeBuf = '';
+        } else {
+          inCode = false;
+          const la = codeLang ? ' class="language-' + escHtml(codeLang) + '"' : '';
+          html += '<pre><code' + la + '>' + escHtml(codeBuf) + '</code></pre>';
+          codeLang = ''; codeBuf = '';
+        }
+        continue;
+      }
+      if (inCode) { codeBuf += (codeBuf ? '\\n' : '') + line; continue; }
+
+      const hMatch = line.match(/^(#{1,3}) (.*)/);
+      if (hMatch) {
+        if (inList) { html += '</' + listTag + '>'; inList = false; }
+        const lvl = hMatch[1].length;
+        html += '<h' + lvl + '>' + inlineMd(hMatch[2]) + '</h' + lvl + '>'; continue;
+      }
+      if (/^---+$/.test(line.trim())) {
+        if (inList) { html += '</' + listTag + '>'; inList = false; }
+        html += '<hr>'; continue;
+      }
+      const ulMatch = line.match(/^[*-] (.*)/);
+      if (ulMatch) {
+        if (!inList || listTag !== 'ul') { if (inList) { html += '</' + listTag + '>'; } html += '<ul>'; inList = true; listTag = 'ul'; }
+        html += '<li>' + inlineMd(ulMatch[1]) + '</li>'; continue;
+      }
+      const olMatch = line.match(/^\d+[.] (.*)/);
+      if (olMatch) {
+        if (!inList || listTag !== 'ol') { if (inList) { html += '</' + listTag + '>'; } html += '<ol>'; inList = true; listTag = 'ol'; }
+        html += '<li>' + inlineMd(olMatch[1]) + '</li>'; continue;
+      }
+      if (inList) { html += '</' + listTag + '>'; inList = false; }
+      const bqMatch = line.match(/^> (.*)/);
+      if (bqMatch) { html += '<blockquote>' + inlineMd(bqMatch[1]) + '</blockquote>'; continue; }
+      if (line.trim() === '') { html += '<p></p>'; continue; }
+      html += '<p>' + inlineMd(line) + '</p>';
+    }
+    if (inList)  { html += '</' + listTag + '>'; }
+    if (inCode && codeBuf) {
+      const la = codeLang ? ' class="language-' + escHtml(codeLang) + '"' : '';
+      html += '<pre><code' + la + '>' + escHtml(codeBuf) + '</code></pre>';
+    }
+    return html;
   }
 </script>
 </body>

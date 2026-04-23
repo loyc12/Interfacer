@@ -79,6 +79,11 @@
           "default": 40000,
           "description": "Max characters of code context to send. Longer content is truncated."
         },
+        "interfacer.maxOutputTokens": {
+          "type": "number",
+          "default": 8192,
+          "description": "Max tokens the model may generate per response. When reached you are prompted to Continue or stop. Supported range: 256–8192 for most Claude models."
+        },
         "interfacer.systemPrompt": {
           "type": "string",
           "default": "",
