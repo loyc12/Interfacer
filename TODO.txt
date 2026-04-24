@@ -1,17 +1,17 @@
 BUGS :
 
-Fix the blinking cursor remaining active once response streaming ends ( just have it be a visual only thing if its easier than saving it as a character in the text )
-Check if formating of received api responses works properly
-make sure " copy to clipboard" and "add to context" buttons work and are present in each received response
+Fix the blinking cursor remaining active once response streaming ends ( start by removing the blinker, and add it back in a way that is easy to discard after ( i.e. a UI only effect ) )
+Check if formating of received api responses works properly, as some things seemed unformated
+Make sure "copy to clipboard" and "add to context" buttons work and are present for each received response, as I failed to find them
 
 
 
 TODO :
 
-nothing
+no new features to add for now, corrections comes first
 
 
 
-MAYBE :
+IN CONSIDERATION :
 
 Check if adding a message history could be useful for context, and how to do that properly

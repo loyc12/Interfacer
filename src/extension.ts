@@ -45,10 +45,41 @@ const SECRET_KEY = 'interfacer.apiKey';
 interface Preset { name: string; content: string; }
 interface FilterProfile { name: string; blocklist: string[]; allowlist: string[]; }
 
+interface InterfacerSettings {
+	model: string;
+	apiKey: string;
+	maxChars: number;
+	maxOutputTokens: number;
+	systemPrompt: string;
+	presets: Preset[];
+	blocklist: string[];
+	allowlist: string[];
+	extraTextExts: string[];
+	respectIgnore: boolean;
+	filterProfiles: FilterProfile[];
+}
+
+function readSettings(): InterfacerSettings {
+	const c = vscode.workspace.getConfiguration('interfacer');
+	return {
+		model:           c.get<string>('model') || MODELS[0].id,
+		apiKey:          c.get<string>('apiKey') || '',
+		maxChars:        c.get<number>('maxContextChars') ?? 40000,
+		maxOutputTokens: c.get<number>('maxOutputTokens') ?? 8192,
+		systemPrompt:    c.get<string>('systemPrompt') || DEFAULT_SYSTEM_PROMPT,
+		presets:         c.get<Preset[]>('promptPresets') ?? DEFAULT_PRESETS,
+		blocklist:       c.get<string[]>('fileBlocklist') ?? [],
+		allowlist:       c.get<string[]>('fileAllowlist') ?? [],
+		extraTextExts:   c.get<string[]>('extraTextExtensions') ?? [],
+		respectIgnore:   c.get<boolean>('respectIgnoreFiles') ?? true,
+		filterProfiles:  c.get<FilterProfile[]>('filterProfiles') ?? [],
+	};
+}
+
 interface ContextItem {
 	label: string;
 	content: string;
-	kind: 'file' | 'selection' | 'terminal';
+	kind: 'file' | 'selection' | 'terminal' | 'response';
 	lineStart: number;
 	lineEnd: number;
 }
@@ -64,15 +95,26 @@ let provider: InterfacerViewProvider;
 // Active streaming request — destroyed on user stop
 let activeReq: ReturnType<typeof https.request> | null = null;
 let userStopped = false;   // distinguishes user abort from network error
-// Saved params from the last callLLM invocation, used for continuation requests
+// Conversation state for the current session.
+// Today `lastConversation` is overwritten on each callLLM invocation (single-shot model).
+// Structured as an array so future multi-turn history can simply push further messages.
+type ChatMsg = { role: 'user' | 'assistant'; content: string };
 let lastCallSysPrompt = '';
-let lastCallUserContent = '';
+let lastConversation: ChatMsg[] = [];
+
+async function resolveApiKey(): Promise<string> {
+	return (await secrets.get(SECRET_KEY)) || readSettings().apiKey || process.env.ANTHROPIC_API_KEY || '';
+}
 
 // ─── Sidebar view provider ────────────────────────────────────────────────────
 
 class InterfacerViewProvider implements vscode.WebviewViewProvider {
 	public static readonly viewType = 'interfacer.chatView';
 	private _view?: vscode.WebviewView;
+	// Messages posted before the webview is resolved are queued here and
+	// flushed on resolve. This avoids losing messages when something like
+	// "focus sidebar + post(openSettings)" fires against a not-yet-created view.
+	private _pending: object[] = [];
 
 	constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -84,18 +126,9 @@ class InterfacerViewProvider implements vscode.WebviewViewProvider {
 		this._view = webviewView;
 		webviewView.webview.options = { enableScripts: true };
 
-		const config = vscode.workspace.getConfiguration('interfacer');
-		const initSystemPrompt = config.get<string>('systemPrompt') || DEFAULT_SYSTEM_PROMPT;
-		const initPresets      = config.get<Preset[]>('promptPresets') ?? DEFAULT_PRESETS;
-		const initBlocklist      = config.get<string[]>('fileBlocklist') ?? [];
-		const initAllowlist      = config.get<string[]>('fileAllowlist') ?? [];
-		const initExtraExts      = config.get<string[]>('extraTextExtensions') ?? [];
-		const initMaxChars        = config.get<number>('maxContextChars') ?? 40000;
-		const initMaxOutputTokens = config.get<number>('maxOutputTokens') ?? 8192;
-		const initFilterProfiles  = config.get<FilterProfile[]>('filterProfiles') ?? [];
-		const initRespectIgnore   = config.get<boolean>('respectIgnoreFiles') ?? true;
-
-		webviewView.webview.html = buildWebviewHtml(initSystemPrompt, initPresets, initBlocklist, initAllowlist, initExtraExts, initMaxChars, initMaxOutputTokens, initFilterProfiles, initRespectIgnore);
+		webviewView.webview.html = buildWebviewHtml(readSettings());
+		for (const m of this._pending) { webviewView.webview.postMessage(m); }
+		this._pending = [];
 
 		webviewView.webview.onDidReceiveMessage(async (msg) => {
 			switch (msg.type) {
@@ -171,23 +204,26 @@ class InterfacerViewProvider implements vscode.WebviewViewProvider {
 		}, null, this.context.subscriptions);
 	}
 
-	post(msg: object) { this._view?.webview.postMessage(msg); }
+	post(msg: object) {
+		if (this._view) { this._view.webview.postMessage(msg); }
+		else { this._pending.push(msg); }
+	}
 
-	focus() { vscode.commands.executeCommand('interfacer.chatView.focus'); }
+	focus() { return vscode.commands.executeCommand('interfacer.chatView.focus'); }
 
 	sendSettings() {
-		const config = vscode.workspace.getConfiguration('interfacer');
+		const s = readSettings();
 		this.post({
 			type: 'updateSettings',
-			systemPrompt:     config.get<string>('systemPrompt') || DEFAULT_SYSTEM_PROMPT,
-			presets:          config.get<Preset[]>('promptPresets') ?? DEFAULT_PRESETS,
-			blocklist:        config.get<string[]>('fileBlocklist') ?? [],
-			allowlist:        config.get<string[]>('fileAllowlist') ?? [],
-			extraTextExts:    config.get<string[]>('extraTextExtensions') ?? [],
-			maxChars:         config.get<number>('maxContextChars') ?? 40000,
-			maxOutputTokens:  config.get<number>('maxOutputTokens') ?? 8192,
-			filterProfiles:   config.get<FilterProfile[]>('filterProfiles') ?? [],
-			respectIgnore:    config.get<boolean>('respectIgnoreFiles') ?? true,
+			systemPrompt:    s.systemPrompt,
+			presets:         s.presets,
+			blocklist:       s.blocklist,
+			allowlist:       s.allowlist,
+			extraTextExts:   s.extraTextExts,
+			maxChars:        s.maxChars,
+			maxOutputTokens: s.maxOutputTokens,
+			filterProfiles:  s.filterProfiles,
+			respectIgnore:   s.respectIgnore,
 		});
 	}
 }
@@ -217,9 +253,7 @@ export function activate(context: vscode.ExtensionContext) {
 		vscode.workspace.onDidChangeConfiguration((e) => {
 			if (e.affectsConfiguration('interfacer.model')) {
 				refreshStatusBar();
-				const cfg = vscode.workspace.getConfiguration('interfacer');
-				const modelId = cfg.get<string>('model') || MODELS[0].id;
-				const match = MODELS.find((m) => m.id === modelId);
+				const match = MODELS.find((m) => m.id === readSettings().model);
 				provider.post({ type: 'modelChanged', label: match?.label ?? 'Haiku' });
 			}
 			if (e.affectsConfiguration('interfacer.systemPrompt') ||
@@ -243,15 +277,14 @@ export function activate(context: vscode.ExtensionContext) {
 		}),
 
 		vscode.commands.registerCommand('interfacer.selectModel', async () => {
-			const config = vscode.workspace.getConfiguration('interfacer');
-			const current = config.get<string>('model') || MODELS[0].id;
+			const current = readSettings().model;
 			const picked = await vscode.window.showQuickPick(
 				MODELS.map((m) => ({ label: m.label, description: m.description, detail: m.id, picked: m.id === current })),
 				{ placeHolder: 'Select Claude model', title: 'Interfacer — switch model' }
 			);
 			if (picked) {
-				const model = MODELS.find((m) => m.label === picked.label)!;
-				await config.update('model', model.id, vscode.ConfigurationTarget.Global);
+				await vscode.workspace.getConfiguration('interfacer')
+					.update('model', picked.detail, vscode.ConfigurationTarget.Global);
 			}
 		}),
 
@@ -406,9 +439,8 @@ async function injectSelectionContext() {
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) { vscode.window.showWarningMessage('Interfacer: no active editor.'); return; }
 
-	const config   = vscode.workspace.getConfiguration('interfacer');
-	const maxChars = config.get<number>('maxContextChars') ?? 40000;
-	const sel      = editor.selection;
+	const { maxChars } = readSettings();
+	const sel = editor.selection;
 	const isWhole  = sel.isEmpty;
 	let text       = isWhole ? editor.document.getText() : editor.document.getText(sel);
 
@@ -569,14 +601,10 @@ function dirIsBlocked(dirName: string, dirRelPath: string, effectiveBlocklist?: 
 }
 
 async function addFolderToContext(folderUri: vscode.Uri) {
-	const config        = vscode.workspace.getConfiguration('interfacer');
-	const maxChars      = config.get<number>('maxContextChars') ?? 40000;
-	const userBlocklist = config.get<string[]>('fileBlocklist') ?? [];
-	const allowlist     = config.get<string[]>('fileAllowlist') ?? [];
-	const respectIgnore = config.get<boolean>('respectIgnoreFiles') ?? true;
-	const extraExts     = new Set(
-		(config.get<string[]>('extraTextExtensions') ?? []).map((e) => e.replace(/^\./, '').toLowerCase())
-	);
+	const s = readSettings();
+	const { maxChars, allowlist, respectIgnore } = s;
+	const userBlocklist = s.blocklist;
+	const extraExts     = new Set(s.extraTextExts.map((e) => e.replace(/^\./, '').toLowerCase()));
 
 	// Merge user blocklist with .gitignore/.vscodeignore patterns (computed now,
 	// not stored — stays in sync with ignore files without touching user settings).
@@ -631,105 +659,100 @@ async function addFolderToContext(folderUri: vscode.Uri) {
 	}
 
 	for (const uri of files.sort((a, b) => a.path.localeCompare(b.path))) {
-		const bytes = await vscode.workspace.fs.readFile(uri);
-		let text    = Buffer.from(bytes).toString('utf8');
-		let truncated = false;
-		if (text.length > maxChars) { text = text.slice(0, maxChars); truncated = true; }
-		const name      = uri.path.split('/').pop() ?? 'file';
-		const lineCount = text.split('\n').length;
-		provider.post({
-			type: 'addContext',
-			item: {
-				label: name + (truncated ? ' — truncated' : ''),
-				content: text, kind: 'file',
-				lineStart: 1, lineEnd: lineCount,
-			} satisfies ContextItem,
-		});
+		await postFileAsContext(uri, maxChars);
 	}
 }
 
-async function addUriToContext(uri: vscode.Uri) {
-	if (!filePassesFilters(uri, '')) {
-		vscode.window.showInformationMessage(`Interfacer: "${uri.path.split('/').pop()}" is excluded by your file filter settings.`);
-		return;
-	}
-	const config   = vscode.workspace.getConfiguration('interfacer');
-	const maxChars = config.get<number>('maxContextChars') ?? 40000;
-
+// Reads a single file, truncates if over maxChars, posts it as a context item.
+async function postFileAsContext(uri: vscode.Uri, maxChars: number): Promise<void> {
 	const bytes = await vscode.workspace.fs.readFile(uri);
 	let text    = Buffer.from(bytes).toString('utf8');
 	let truncated = false;
 	if (text.length > maxChars) { text = text.slice(0, maxChars); truncated = true; }
-
-	const fileName  = uri.path.split('/').pop() ?? 'file';
-	const lineCount = text.split('\n').length;
+	const name = uri.path.split('/').pop() ?? 'file';
 	provider.post({
 		type: 'addContext',
 		item: {
-			label: fileName + (truncated ? ' — truncated' : ''),
+			label: name + (truncated ? ' — truncated' : ''),
 			content: text, kind: 'file',
-			lineStart: 1, lineEnd: lineCount,
+			lineStart: 1, lineEnd: text.split('\n').length,
 		} satisfies ContextItem,
 	});
+}
+
+async function addUriToContext(uri: vscode.Uri) {
+	const s = readSettings();
+	const name = uri.path.split('/').pop() ?? 'file';
+
+	if (!filePassesFilters(uri, '')) {
+		vscode.window.showInformationMessage(`Interfacer: "${name}" is excluded by your file filter settings.`);
+		return;
+	}
+	// Also apply the built-in text-extension check so users don't accidentally
+	// attach binaries (.png, .bin, …). If the extension isn't recognized, ask
+	// first — the file may be text with an unusual extension the user wants to
+	// whitelist via extraTextExtensions.
+	const extraExts = new Set(s.extraTextExts.map((e) => e.replace(/^\./, '').toLowerCase()));
+	if (!isTextFile(uri, extraExts)) {
+		const choice = await vscode.window.showWarningMessage(
+			`Interfacer: "${name}" isn't a recognized text file. Add it anyway?`,
+			'Add anyway',
+			'Open File Filters',
+		);
+		if (choice === 'Open File Filters') {
+			await provider.focus();
+			provider.post({ type: 'openSettings', section: 'filters' });
+			return;
+		}
+		if (choice !== 'Add anyway') { return; }
+	}
+	await postFileAsContext(uri, s.maxChars);
 }
 
 // ─── LLM call ─────────────────────────────────────────────────────────────────
 
 function callLLM(prompt: string, contexts: ContextItem[], preset?: string): void {
 	(async () => {
-	const config   = vscode.workspace.getConfiguration('interfacer');
-	const apiKey   =
-		(await secrets.get(SECRET_KEY)) ||
-		config.get<string>('apiKey') ||
-		process.env.ANTHROPIC_API_KEY || '';
-	const model      = config.get<string>('model') || MODELS[0].id;
-	const maxTokens  = config.get<number>('maxOutputTokens') ?? 8192;
-	const baseSys    = config.get<string>('systemPrompt') || DEFAULT_SYSTEM_PROMPT;
-	const systemPrompt = preset ? baseSys + '\n\n' + preset : baseSys;
+		const apiKey = await resolveApiKey();
+		if (!apiKey) {
+			provider.post({ type: 'responseError', text: 'No API key configured. Click 🔑 or run Interfacer: Set API Key.' });
+			return;
+		}
+		const { model, maxOutputTokens, systemPrompt: baseSys } = readSettings();
+		const systemPrompt = preset ? baseSys + '\n\n' + preset : baseSys;
 
-	if (!apiKey) {
-		provider.post({ type: 'responseError', text: 'No API key configured. Click 🔑 or run Interfacer: Set API Key.' });
-		return;
-	}
+		let userContent = '';
+		if (contexts.length > 0) {
+			userContent = contexts
+				.map((c) => `### ${c.label}\n\`\`\`\n${c.content}\n\`\`\``)
+				.join('\n\n') + '\n\n';
+		}
+		userContent += prompt;
 
-	let userContent = '';
-	if (contexts.length > 0) {
-		userContent = contexts
-			.map((c) => `### ${c.label}\n\`\`\`\n${c.content}\n\`\`\``)
-			.join('\n\n') + '\n\n';
-	}
-	userContent += prompt;
-
-	// Save for potential continuation request
-	lastCallSysPrompt    = systemPrompt;
-	lastCallUserContent  = userContent;
-
-	streamRequest(apiKey, systemPrompt, [{ role: 'user', content: userContent }], model, maxTokens);
+		lastCallSysPrompt = systemPrompt;
+		lastConversation  = [{ role: 'user', content: userContent }];
+		streamRequest(apiKey, systemPrompt, lastConversation, model, maxOutputTokens);
 	})();
 }
 
 function continueGeneration(accumulatedText: string): void {
 	(async () => {
-	const config  = vscode.workspace.getConfiguration('interfacer');
-	const apiKey  =
-		(await secrets.get(SECRET_KEY)) ||
-		config.get<string>('apiKey') ||
-		process.env.ANTHROPIC_API_KEY || '';
-	const model      = config.get<string>('model') || MODELS[0].id;
-	const maxTokens  = config.get<number>('maxOutputTokens') ?? 8192;
-
-	streamRequest(apiKey, lastCallSysPrompt, [
-		{ role: 'user',      content: lastCallUserContent },
-		{ role: 'assistant', content: accumulatedText },
-		{ role: 'user',      content: 'Please continue.' },
-	], model, maxTokens);
+		const apiKey = await resolveApiKey();
+		if (!apiKey) { return; }
+		const { model, maxOutputTokens } = readSettings();
+		const msgs: ChatMsg[] = [
+			...lastConversation,
+			{ role: 'assistant', content: accumulatedText },
+			{ role: 'user',      content: 'Please continue.' },
+		];
+		streamRequest(apiKey, lastCallSysPrompt, msgs, model, maxOutputTokens);
 	})();
 }
 
 function streamRequest(
 	apiKey: string,
 	systemPrompt: string,
-	messages: { role: string; content: string }[],
+	messages: ChatMsg[],
 	model: string,
 	maxTokens: number,
 ): void {
@@ -737,9 +760,18 @@ function streamRequest(
 		model, max_tokens: maxTokens, stream: true, system: systemPrompt, messages,
 	});
 
-	// Shared across the response callback and req.on('error') to prevent double-posting.
+	// Guards against double-posting from multiple terminal paths (res.end / error / req error).
 	let finished = false;
 	let hitMaxTokens = false;
+
+	// Marks the request done and posts once. Returns false if already finished
+	// so callers can early-out without duplicating cleanup code.
+	const finish = (post: () => void): void => {
+		if (finished) { activeReq = null; return; }
+		finished = true;
+		activeReq = null;
+		post();
+	};
 
 	const req = https.request(
 		{
@@ -757,14 +789,11 @@ function streamRequest(
 			if (res.statusCode !== 200) {
 				let raw = '';
 				res.on('data', (chunk: Buffer) => { raw += chunk.toString(); });
-				res.on('end', () => {
-					if (finished) { return; }
-					finished = true; activeReq = null;
-					try {
-						const parsed = JSON.parse(raw);
-						provider.post({ type: 'responseError', text: `API error (${res.statusCode}): ${parsed.error?.message ?? raw.slice(0, 300)}` });
-					} catch { provider.post({ type: 'responseError', text: `API error (${res.statusCode}): ${raw.slice(0, 300)}` }); }
-				});
+				res.on('end', () => finish(() => {
+					let msg = raw.slice(0, 300);
+					try { msg = JSON.parse(raw).error?.message ?? msg; } catch { /* keep raw */ }
+					provider.post({ type: 'responseError', text: `API error (${res.statusCode}): ${msg}` });
+				}));
 				return;
 			}
 
@@ -797,50 +826,38 @@ function streamRequest(
 							if (p.delta?.stop_reason === 'max_tokens') { hitMaxTokens = true; }
 						} catch { /* ignore */ }
 					} else if (evtType === 'message_stop') {
-						finished = true;
-						activeReq = null;
-						if (hitMaxTokens) {
-							provider.post({ type: 'maxTokensReached' });
-						} else {
-							provider.post({ type: 'responseEnd' });
-						}
+						finish(() => provider.post({ type: hitMaxTokens ? 'maxTokensReached' : 'responseEnd' }));
 					} else if (evtType === 'error') {
-						finished = true;
-						activeReq = null;
-						try {
-							const p = JSON.parse(evtData);
-							provider.post({ type: 'responseError', text: `API error: ${p.error?.message ?? evtData}` });
-						} catch { provider.post({ type: 'responseError', text: `API error: ${evtData}` }); }
+						finish(() => {
+							let m = evtData;
+							try { m = JSON.parse(evtData).error?.message ?? evtData; } catch { /* keep raw */ }
+							provider.post({ type: 'responseError', text: `API error: ${m}` });
+						});
 					}
 				}
 			});
 
-			res.on('end', () => {
-				if (finished) { activeReq = null; return; }
-				finished = true; activeReq = null;
+			// Normal stream-end (rare — message_stop should have already fired) and
+			// mid-stream abort from req.destroy() both route here. If the stream
+			// ended without a message_stop but we've already seen stop_reason=
+			// max_tokens, surface the Continue/Done prompt anyway.
+			const endAsStop = () => finish(() => {
 				if (userStopped) { userStopped = false; }
-				provider.post({ type: 'responseEnd' });
+				provider.post({ type: hitMaxTokens ? 'maxTokensReached' : 'responseEnd' });
 			});
-			// req.destroy() mid-stream emits 'error' on res, not on req — handle it here.
-			res.on('error', () => {
-				if (finished) { return; }
-				finished = true; activeReq = null;
-				if (userStopped) { userStopped = false; }
-				provider.post({ type: 'responseEnd' });
-			});
+			res.on('end', endAsStop);
+			res.on('error', endAsStop);
 		}
 	);
 	activeReq = req;
-	req.on('error', (e: Error) => {
-		if (finished) { activeReq = null; return; }
-		finished = true; activeReq = null;
+	req.on('error', (e: Error) => finish(() => {
 		if (userStopped) {
 			userStopped = false;
 			provider.post({ type: 'responseEnd' });
 		} else {
 			provider.post({ type: 'responseError', text: `Request failed: ${e.message}` });
 		}
-	});
+	}));
 	req.write(body);
 	req.end();
 }
@@ -848,28 +865,26 @@ function streamRequest(
 // ─── Status bar ───────────────────────────────────────────────────────────────
 
 function refreshStatusBar() {
-	const config  = vscode.workspace.getConfiguration('interfacer');
-	const modelId = config.get<string>('model') || MODELS[0].id;
-	const match   = MODELS.find((m) => m.id === modelId);
+	const match = MODELS.find((m) => m.id === readSettings().model);
 	statusBarItem.text = `$(hubot) ${match?.label ?? 'Interfacer'}`;
 }
 
 // ─── Webview HTML ─────────────────────────────────────────────────────────────
 
-function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initBlocklist: string[], initAllowlist: string[], initExtraExts: string[], initMaxChars: number, initMaxOutputTokens: number, initFilterProfiles: FilterProfile[], initRespectIgnore: boolean): string {
+function buildWebviewHtml(s: InterfacerSettings): string {
 	const nonce = crypto.randomBytes(16).toString('hex');
 
 	// Safely embed JS values
-	const jsSystemPrompt      = JSON.stringify(initSystemPrompt);
-	const jsPresets           = JSON.stringify(initPresets);
+	const jsSystemPrompt      = JSON.stringify(s.systemPrompt);
+	const jsPresets           = JSON.stringify(s.presets);
 	const jsDefaultSys        = JSON.stringify(DEFAULT_SYSTEM_PROMPT);
-	const jsBlocklist         = JSON.stringify(initBlocklist);
-	const jsAllowlist         = JSON.stringify(initAllowlist);
-	const jsExtraExts         = JSON.stringify(initExtraExts);
-	const jsMaxChars          = JSON.stringify(initMaxChars);
-	const jsMaxOutputTokens   = JSON.stringify(initMaxOutputTokens);
-	const jsFilterProfiles    = JSON.stringify(initFilterProfiles);
-	const jsRespectIgnore     = JSON.stringify(initRespectIgnore);
+	const jsBlocklist         = JSON.stringify(s.blocklist);
+	const jsAllowlist         = JSON.stringify(s.allowlist);
+	const jsExtraExts         = JSON.stringify(s.extraTextExts);
+	const jsMaxChars          = JSON.stringify(s.maxChars);
+	const jsMaxOutputTokens   = JSON.stringify(s.maxOutputTokens);
+	const jsFilterProfiles    = JSON.stringify(s.filterProfiles);
+	const jsRespectIgnore     = JSON.stringify(s.respectIgnore);
 
 	return /* html */`<!DOCTYPE html>
 <html lang="en">
@@ -964,12 +979,34 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
   .msg-body blockquote { border-left: 3px solid var(--vscode-widget-border, #555); margin: 0.3em 0; padding: 0 0.6em; opacity: 0.8; }
   .msg-body strong { font-weight: 700; }
   .msg-body em { font-style: italic; }
+  .msg-body a { color: var(--vscode-textLink-foreground); text-decoration: underline; }
+  .msg-body a:hover { color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground)); }
   /* Message action buttons (copy, add-to-context) */
-  .msg-actions { display: flex; gap: 4px; margin-top: 5px; }
-  .msg-act-btn { background: none; border: none; cursor: pointer; padding: 2px 5px; border-radius: 2px; font-size: 0.78em; opacity: 0.45; color: var(--vscode-foreground); font-family: inherit; }
-  .msg-act-btn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
-  /* Streaming cursor */
-  .stream-cursor { display: inline-block; width: 7px; height: 0.85em; background: var(--vscode-foreground); opacity: 0.6; animation: blink 1s step-end infinite; vertical-align: text-bottom; margin-left: 1px; }
+  .msg-actions { display: flex; gap: 4px; margin: 4px 0 6px; }
+  /* Brief flash when a response is added to context via right-click */
+  @keyframes flashAdded { 0% { background: var(--vscode-editor-findMatchHighlightBackground, rgba(255,200,0,0.25)); } 100% { background: var(--vscode-editor-inactiveSelectionBackground); } }
+  .msg.flash-added { animation: flashAdded 0.6s ease-out; }
+  .msg-act-btn {
+    cursor: pointer; padding: 2px 7px; border-radius: 2px; font-size: 0.78em;
+    color: var(--vscode-descriptionForeground); font-family: inherit;
+    background: var(--vscode-button-secondaryBackground, transparent);
+    border: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.35));
+    opacity: 0.8;
+  }
+  .msg-act-btn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+  .msg-act-btn:disabled { cursor: default; opacity: 0.5; }
+  /* Streaming cursor — pure CSS, activated by the .streaming class on the message wrapper.
+     Removing the class is the only thing needed to discard the cursor. */
+  .msg.streaming .msg-body::after {
+    content: '';
+    display: inline-block;
+    width: 7px; height: 0.85em;
+    background: var(--vscode-foreground);
+    opacity: 0.6;
+    animation: blink 1s step-end infinite;
+    vertical-align: text-bottom;
+    margin-left: 2px;
+  }
   @keyframes blink { 0%, 100% { opacity: 0.6; } 50% { opacity: 0; } }
   /* Spinner in status bar */
   .spin { display: inline-block; animation: spin 0.8s linear infinite; }
@@ -1007,12 +1044,15 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
   #preview-wrap { border-top: 1px solid var(--vscode-widget-border, #333); margin-top: 2px; }
   #btn-preview { width: 100%; text-align: left; background: transparent; border: none; cursor: pointer; padding: 4px 6px; font-family: inherit; font-size: 0.78em; color: var(--vscode-descriptionForeground); opacity: 0.7; }
   #btn-preview:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
-  #preview-panel { display: none; flex-direction: column; font-size: 0.78em; background: var(--vscode-textBlockQuote-background, var(--vscode-editor-inactiveSelectionBackground)); border-radius: 3px; overflow: hidden; margin-bottom: 2px; }
+  /* The panel itself caps its height (viewport-relative) and scrolls internally
+     so individual sections can show their full content — no hard truncation. */
+  #preview-panel { display: none; flex-direction: column; font-size: 0.78em; background: var(--vscode-textBlockQuote-background, var(--vscode-editor-inactiveSelectionBackground)); border-radius: 3px; margin-bottom: 2px; max-height: 40vh; overflow-y: auto; }
   #preview-panel.open { display: flex; }
   .pv-section { padding: 5px 8px; border-bottom: 1px solid var(--vscode-widget-border, #333); }
   .pv-section:last-child { border-bottom: none; }
   .pv-section-label { font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.5; margin-bottom: 3px; }
-  .pv-text { white-space: pre-wrap; word-break: break-word; opacity: 0.8; line-height: 1.4; max-height: 60px; overflow: hidden; }
+  .pv-section-label .pv-section-sublabel { text-transform: none; letter-spacing: 0; opacity: 0.75; }
+  .pv-text { white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; opacity: 0.8; line-height: 1.4; }
   .pv-ctx-row { display: flex; align-items: center; gap: 5px; padding: 1px 0; opacity: 0.85; }
   .pv-ctx-row-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .pv-ctx-row-meta { flex-shrink: 0; opacity: 0.6; }
@@ -1113,8 +1153,12 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
       <button id="btn-preview">▶ Preview full payload</button>
       <div id="preview-panel">
         <div class="pv-section">
-          <div class="pv-section-label">System prompt <span id="pv-preset-badge" style="display:none;opacity:0.6;">+ preset</span></div>
+          <div class="pv-section-label">System prompt</div>
           <div class="pv-text" id="pv-system"></div>
+        </div>
+        <div class="pv-section" id="pv-preset-section" style="display:none;">
+          <div class="pv-section-label">Header preset <span class="pv-section-sublabel" id="pv-preset-name"></span></div>
+          <div class="pv-text" id="pv-preset-content"></div>
         </div>
         <div class="pv-section">
           <div class="pv-section-label">Context items</div>
@@ -1328,7 +1372,7 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
     <div class="sv-desc" style="margin-bottom:4px;">When reached, you will be prompted to Continue or stop. Supported range: 1–8192 for most models.</div>
     <input type="number" id="sv-max-out-tokens" class="sv-input" min="256" max="8192" step="256" style="width:140px;" />
     <div class="sv-btn-row" style="margin-top:4px;">
-      <button class="tool-btn ghost" id="sv-reset-max-out-tokens">Reset (8,192)</button>
+      <button class="tool-btn ghost" id="sv-reset-max-out-tokens">Reset (8192)</button>
       <div class="spacer"></div>
       <span class="sv-saved-notice" id="sv-max-out-tokens-saved" style="display:none;">Saved.</span>
       <button class="tool-btn primary" id="sv-save-max-out-tokens">Save</button>
@@ -1364,9 +1408,11 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
   const btnStop       = document.getElementById('btn-stop');
   const btnPreview    = document.getElementById('btn-preview');
   const previewPanel  = document.getElementById('preview-panel');
-  const pvSystem      = document.getElementById('pv-system');
-  const pvPresetBadge = document.getElementById('pv-preset-badge');
-  const pvCtxRows     = document.getElementById('pv-ctx-rows');
+  const pvSystem         = document.getElementById('pv-system');
+  const pvPresetSection  = document.getElementById('pv-preset-section');
+  const pvPresetName     = document.getElementById('pv-preset-name');
+  const pvPresetContent  = document.getElementById('pv-preset-content');
+  const pvCtxRows        = document.getElementById('pv-ctx-rows');
   const pvEmptyNote   = document.getElementById('pv-empty-note');
   const pvPromptEcho  = document.getElementById('pv-prompt-echo');
   const pvStats       = document.getElementById('pv-stats');
@@ -1701,6 +1747,16 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
   }
 
   // ── Context list ────────────────────────────────────────────────────────────
+  function ctxIcon(kind) {
+    return kind === 'selection' ? '✂' : kind === 'terminal' ? '>_' : kind === 'response' ? '💬' : '📄';
+  }
+  function ctxMeta(c) {
+    const n = c.lineEnd - c.lineStart + 1;
+    return c.kind === 'selection'
+      ? 'lines ' + c.lineStart + '–' + c.lineEnd + ' (' + n + ')'
+      : n + ' lines';
+  }
+
   function addContext(item) {
     contexts.push({ id: nextId++, ...item });
     renderCtxList();
@@ -1723,16 +1779,12 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
     ctxList.innerHTML = '';
     ctxHeader.classList.toggle('visible', contexts.length > 0);
     contexts.forEach((c) => {
-      const lineCount = c.lineEnd - c.lineStart + 1;
-      const metaText  = c.kind === 'selection'
-        ? 'lines ' + c.lineStart + '–' + c.lineEnd + ' (' + lineCount + ')'
-        : lineCount + ' lines';
       const row = document.createElement('div');
       row.className = 'ctx-item';
       row.innerHTML =
-        '<span class="ctx-item-icon">' + (c.kind === 'selection' ? '✂' : c.kind === 'terminal' ? '>_' : '📄') + '</span>' +
+        '<span class="ctx-item-icon">' + ctxIcon(c.kind) + '</span>' +
         '<span class="ctx-item-name" title="' + escHtml(c.label) + '">' + escHtml(c.label) + '</span>' +
-        '<span class="ctx-item-meta">' + metaText + '</span>' +
+        '<span class="ctx-item-meta">' + ctxMeta(c) + '</span>' +
         '<button class="ctx-item-rm" title="Remove">✕</button>';
       row.querySelector('.ctx-item-rm').addEventListener('click', () => removeContext(c.id));
       ctxList.appendChild(row);
@@ -1741,32 +1793,34 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
 
   // ── Preview ─────────────────────────────────────────────────────────────────
   function renderPreview() {
+    pvSystem.textContent = systemPrompt;
     const preset = selectedPreset();
-    const effectiveSys = preset ? systemPrompt + '\\n\\n' + preset.content : systemPrompt;
-    pvSystem.textContent = effectiveSys;
-    pvPresetBadge.style.display = preset ? 'inline' : 'none';
+    if (preset) {
+      pvPresetSection.style.display = 'block';
+      pvPresetName.textContent = '· ' + preset.name;
+      pvPresetContent.textContent = preset.content;
+    } else {
+      pvPresetSection.style.display = 'none';
+    }
 
     pvCtxRows.innerHTML = '';
     pvEmptyNote.style.display = contexts.length === 0 ? 'block' : 'none';
     contexts.forEach((c) => {
-      const lineCount = c.lineEnd - c.lineStart + 1;
-      const meta = c.kind === 'selection'
-        ? 'lines ' + c.lineStart + '–' + c.lineEnd + ' (' + lineCount + ')'
-        : lineCount + ' lines';
       const row = document.createElement('div');
       row.className = 'pv-ctx-row';
       row.innerHTML =
-        '<span>' + (c.kind === 'selection' ? '✂' : c.kind === 'terminal' ? '>_' : '📄') + '</span>' +
+        '<span>' + ctxIcon(c.kind) + '</span>' +
         '<span class="pv-ctx-row-name">' + escHtml(c.label) + '</span>' +
-        '<span class="pv-ctx-row-meta">' + meta + '</span>';
+        '<span class="pv-ctx-row-meta">' + ctxMeta(c) + '</span>';
       pvCtxRows.appendChild(row);
     });
 
     const promptText = promptEl.value.trim();
     pvPromptEcho.textContent = promptText || '[type below]';
 
-    const ctxChars   = contexts.reduce((s, c) => s + c.content.length, 0);
-    const totalChars = effectiveSys.length + ctxChars + promptText.length;
+    const ctxChars    = contexts.reduce((s, c) => s + c.content.length, 0);
+    const presetChars = preset ? preset.content.length + 2 : 0;  // "\n\n" join
+    const totalChars  = systemPrompt.length + presetChars + ctxChars + promptText.length;
     pvStats.textContent = '~' + totalChars.toLocaleString() + ' chars · ~' + Math.ceil(totalChars / 4).toLocaleString() + ' tokens est.';
   }
 
@@ -1812,6 +1866,58 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
   }
 
   // ── Log ─────────────────────────────────────────────────────────────────────
+  // Inserts Copy / Add-to-context buttons at the top of an assistant message
+  // (just under the "Assistant" label) and wires right-click on the whole
+  // message to the same "Add to context" action. rawText is the unrendered
+  // text so Copy yields plain markdown and the context item stores the same.
+  function attachMessageActions(wrapper, rawText) {
+    const actions = document.createElement('div');
+    actions.className = 'msg-actions';
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'msg-act-btn';
+    copyBtn.title = 'Copy response';
+    copyBtn.textContent = '⧉ Copy';
+    copyBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(rawText).then(
+        () => { copyBtn.textContent = '✔ Copied'; setTimeout(() => { copyBtn.textContent = '⧉ Copy'; }, 1500); },
+        () => {}
+      );
+    });
+    const ctxBtn = document.createElement('button');
+    ctxBtn.className = 'msg-act-btn';
+    ctxBtn.title = 'Add this response to context (or right-click the message)';
+    ctxBtn.textContent = '↙ Add to context';
+    const doAdd = () => {
+      if (ctxBtn.disabled) return;
+      const lines = rawText.split('\\n').length;
+      addContext({ label: 'Response', content: rawText, kind: 'response', lineStart: 1, lineEnd: lines });
+      ctxBtn.textContent = '✔ Added';
+      ctxBtn.disabled = true;
+    };
+    ctxBtn.addEventListener('click', doAdd);
+    actions.appendChild(copyBtn);
+    actions.appendChild(ctxBtn);
+
+    // Right-click anywhere on the message = add to context, unless the user
+    // has text selected (in which case we let the default "Copy" menu show).
+    wrapper.addEventListener('contextmenu', (e) => {
+      const sel = window.getSelection();
+      if (sel && sel.toString().length > 0) { return; }
+      e.preventDefault();
+      if (ctxBtn.disabled) { return; }
+      doAdd();
+      wrapper.classList.remove('flash-added');
+      // force reflow so re-adding the class restarts the animation
+      void wrapper.offsetWidth;
+      wrapper.classList.add('flash-added');
+    });
+
+    // Insert just after the label (which is always the first child).
+    const label = wrapper.querySelector('.msg-label');
+    if (label && label.nextSibling) { wrapper.insertBefore(actions, label.nextSibling); }
+    else { wrapper.appendChild(actions); }
+  }
+
   function addMessage(role, text, ctxSummary) {
     const wrapper = document.createElement('div');
     wrapper.className = 'msg ' + role;
@@ -1823,26 +1929,9 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
     body.className = 'msg-body';
     if (role === 'assistant') {
       body.innerHTML = renderMarkdown(text);
-      const actions = document.createElement('div');
-      actions.className = 'msg-actions';
-      const copyBtn = document.createElement('button');
-      copyBtn.className = 'msg-act-btn';
-      copyBtn.title = 'Copy response';
-      copyBtn.textContent = '⧉ Copy';
-      copyBtn.addEventListener('click', () => navigator.clipboard.writeText(text).catch(() => {}));
-      const ctxBtn = document.createElement('button');
-      ctxBtn.className = 'msg-act-btn';
-      ctxBtn.title = 'Add this response to context';
-      ctxBtn.textContent = '↙ Add to context';
-      ctxBtn.addEventListener('click', () => {
-        addContext({ label: 'Response', content: text, kind: 'text' });
-        ctxBtn.textContent = '✔ Added';
-        ctxBtn.disabled = true;
-      });
-      actions.appendChild(copyBtn);
-      actions.appendChild(ctxBtn);
+      // Actions first (inserted after label), body second.
+      attachMessageActions(wrapper, text);
       wrapper.appendChild(body);
-      wrapper.appendChild(actions);
     } else {
       body.textContent = text;
       wrapper.appendChild(body);
@@ -1852,49 +1941,27 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
     return wrapper;
   }
 
-  // Creates a streaming message placeholder and returns it.
-  // The cursor is a real DOM node (not embedded in innerHTML) so it can be removed explicitly.
+  // Creates a streaming message placeholder. The blinking cursor is a CSS ::after
+  // pseudo-element driven by the 'streaming' class on the wrapper — removing that class
+  // (on responseEnd / error / done / etc.) is all that's needed to discard the cursor.
   function startStreamingMessage() {
     const wrapper = document.createElement('div');
-    wrapper.className = 'msg assistant';
+    wrapper.className = 'msg assistant streaming';
     const lbl = document.createElement('div');
     lbl.className = 'msg-label';
     lbl.textContent = 'Assistant';
     wrapper.appendChild(lbl);
     const body = document.createElement('div');
     body.className = 'msg-body';
-    const streamText = document.createElement('span');
-    body.appendChild(streamText);
-    const cursor = document.createElement('span');
-    cursor.className = 'stream-cursor';
-    body.appendChild(cursor);
     wrapper.appendChild(body);
     logEl.appendChild(wrapper);
     logEl.scrollTop = logEl.scrollHeight;
-    return { wrapper, body, streamText, cursor };
+    return { wrapper, body };
   }
 
   function finalizeStreamingMessage(wrapper, body, rawText) {
     body.innerHTML = renderMarkdown(rawText);
-    const actions = document.createElement('div');
-    actions.className = 'msg-actions';
-    const copyBtn = document.createElement('button');
-    copyBtn.className = 'msg-act-btn';
-    copyBtn.title = 'Copy response';
-    copyBtn.textContent = '⧉ Copy';
-    copyBtn.addEventListener('click', () => navigator.clipboard.writeText(rawText).catch(() => {}));
-    const ctxBtn = document.createElement('button');
-    ctxBtn.className = 'msg-act-btn';
-    ctxBtn.title = 'Add this response to context';
-    ctxBtn.textContent = '↙ Add to context';
-    ctxBtn.addEventListener('click', () => {
-      addContext({ label: 'Response', content: rawText, kind: 'text' });
-      ctxBtn.textContent = '✔ Added';
-      ctxBtn.disabled = true;
-    });
-    actions.appendChild(copyBtn);
-    actions.appendChild(ctxBtn);
-    wrapper.appendChild(actions);
+    attachMessageActions(wrapper, rawText);
     logEl.scrollTop = logEl.scrollHeight;
   }
 
@@ -1929,10 +1996,10 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
   window.addEventListener('message', (e) => {
     const msg = e.data;
     if (msg.type === 'chunk') {
-      if (!streamMsgDiv) { const els = startStreamingMessage(); streamMsgDiv = els; }
+      if (!streamMsgDiv) { streamMsgDiv = startStreamingMessage(); }
       streamBuf += msg.text;
-      // Show raw text while streaming (fast, cursor stays visible)
-      streamMsgDiv.body.innerHTML = escHtml(streamBuf) + '<span class="stream-cursor"></span>';
+      // Show raw text while streaming — the CSS-driven cursor stays visible via the .streaming class.
+      streamMsgDiv.body.innerHTML = escHtml(streamBuf);
       logEl.scrollTop = logEl.scrollHeight;
     }
     else if (msg.type === 'responseEnd') {
@@ -1940,17 +2007,28 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
       // Capture and clear state before finalize — ensures cleanup even if finalize throws.
       const _div = streamMsgDiv; const _buf = streamBuf;
       streamMsgDiv = null; streamBuf = '';
-      if (_div) { try { finalizeStreamingMessage(_div.wrapper, _div.body, _buf); } catch(e) { console.error('[Interfacer] finalize error:', e); } }
+      if (_div) {
+        _div.wrapper.classList.remove('streaming');
+        try { finalizeStreamingMessage(_div.wrapper, _div.body, _buf); } catch(e) { console.error('[Interfacer] finalize error:', e); }
+      }
     }
     else if (msg.type === 'maxTokensReached') {
-      // Keep waiting=true — don't re-enable Send until user decides
       btnStop.classList.remove('visible');
       statusEl.textContent = '';
-      if (streamMsgDiv) {
+      if (!streamMsgDiv) {
+        // Edge case: max_tokens hit before any content arrived, or stream state
+        // was lost. Don't leave the UI frozen — re-enable sending and surface
+        // a short note so the user can try again with a higher token cap.
+        waiting = false; btnSend.disabled = false; streamBuf = '';
+        addMessage('assistant', '(Response limit reached before any content. Raise "Max output tokens" in Settings and retry.)', null);
+      } else {
+        // Keep waiting=true until user clicks Continue or Done.
         // Capture and clear outer state immediately — Continue/Done use closures.
         const savedBuf = streamBuf;
         const savedDiv = streamMsgDiv;
         streamMsgDiv = null; streamBuf = '';
+        // Stop the streaming cursor while awaiting user decision.
+        savedDiv.wrapper.classList.remove('streaming');
         // Render what we have so far, then add Continue/Done prompt
         savedDiv.body.innerHTML = renderMarkdown(savedBuf);
         const prompt = document.createElement('div');
@@ -1970,7 +2048,8 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
           prompt.remove();
           // Re-enter streaming state using the saved references.
           streamBuf = savedBuf; streamMsgDiv = savedDiv;
-          savedDiv.body.innerHTML = renderMarkdown(savedBuf) + '<span class="stream-cursor"></span>';
+          savedDiv.wrapper.classList.add('streaming');
+          savedDiv.body.innerHTML = renderMarkdown(savedBuf);
           btnSend.disabled = true; btnStop.classList.add('visible');
           statusEl.innerHTML = '<span class="spin">↻</span> Responding…';
           vscode.postMessage({ type: 'continueGeneration', accumulatedText: savedBuf });
@@ -1985,8 +2064,11 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
     }
     else if (msg.type === 'responseError') {
       waiting = false; btnSend.disabled = false; btnStop.classList.remove('visible'); statusEl.textContent = '';
-      if (streamMsgDiv) { streamMsgDiv.body.innerHTML = '<em style="opacity:0.6">' + escHtml(msg.text) + '</em>'; }
-      else              { addMessage('assistant', msg.text, null); }
+      if (streamMsgDiv) {
+        streamMsgDiv.wrapper.classList.remove('streaming');
+        streamMsgDiv.body.innerHTML = '<em style="opacity:0.6">' + escHtml(msg.text) + '</em>';
+      }
+      else { addMessage('assistant', msg.text, null); }
       streamMsgDiv = null; streamBuf = '';
     }
     else if (msg.type === 'addContext')     { addContext(msg.item); }
@@ -2031,6 +2113,13 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
 
   function inlineMd(s) {
     s = escHtml(s);
+    // Links [text](url). Only accept http(s), mailto, in-page anchors and
+    // relative paths — refuses javascript:/data: URLs to avoid XSS.
+    s = s.replace(/\\[([^\\]]+)\\]\\(([^)\\s]+)\\)/g, (m, text, url) => {
+      const t = url.trim();
+      if (!/^(https?:|mailto:|#|\\/|\\.)/i.test(t)) return m;
+      return '<a href="' + t + '" target="_blank" rel="noopener noreferrer">' + text + '</a>';
+    });
     s = s.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
     s = s.replace(/\*\*(.+?)\*\*/g,     '<strong>$1</strong>');
     s = s.replace(/\*(.+?)\*/g,         '<em>$1</em>');
@@ -2047,11 +2136,22 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
     let codeBuf = '';
     let inList = false;
     let listTag = 'ul';
+    let paraBuf = [];  // accumulates consecutive non-blank lines of the current paragraph
+
+    const flushPara = () => {
+      if (paraBuf.length === 0) return;
+      // Join paragraph lines with <br> to preserve visual hard-wraps from the model.
+      html += '<p>' + paraBuf.map(inlineMd).join('<br>') + '</p>';
+      paraBuf = [];
+    };
+    const closeList = () => {
+      if (inList) { html += '</' + listTag + '>'; inList = false; }
+    };
 
     for (const line of lines) {
       if (_isFence(line)) {
         if (!inCode) {
-          if (inList) { html += '</' + listTag + '>'; inList = false; }
+          flushPara(); closeList();
           inCode = true; codeLang = line.slice(3).trim(); codeBuf = '';
         } else {
           inCode = false;
@@ -2063,33 +2163,45 @@ function buildWebviewHtml(initSystemPrompt: string, initPresets: Preset[], initB
       }
       if (inCode) { codeBuf += (codeBuf ? '\\n' : '') + line; continue; }
 
+      // TODO: Markdown tables are not rendered. To add them, detect a header
+      // line followed by a |---|---| separator here (before the heading match),
+      // collect subsequent |-lines until a non-|-line, and emit a <table>.
+      // Remember to flushPara() and closeList() before opening the table.
+
       const hMatch = line.match(/^(#{1,3}) (.*)/);
       if (hMatch) {
-        if (inList) { html += '</' + listTag + '>'; inList = false; }
+        flushPara(); closeList();
         const lvl = hMatch[1].length;
         html += '<h' + lvl + '>' + inlineMd(hMatch[2]) + '</h' + lvl + '>'; continue;
       }
       if (/^---+$/.test(line.trim())) {
-        if (inList) { html += '</' + listTag + '>'; inList = false; }
+        flushPara(); closeList();
         html += '<hr>'; continue;
       }
       const ulMatch = line.match(/^[*-] (.*)/);
       if (ulMatch) {
-        if (!inList || listTag !== 'ul') { if (inList) { html += '</' + listTag + '>'; } html += '<ul>'; inList = true; listTag = 'ul'; }
+        flushPara();
+        if (!inList || listTag !== 'ul') { closeList(); html += '<ul>'; inList = true; listTag = 'ul'; }
         html += '<li>' + inlineMd(ulMatch[1]) + '</li>'; continue;
       }
-      const olMatch = line.match(/^\d+[.] (.*)/);
+      const olMatch = line.match(/^\\d+[.] (.*)/);
       if (olMatch) {
-        if (!inList || listTag !== 'ol') { if (inList) { html += '</' + listTag + '>'; } html += '<ol>'; inList = true; listTag = 'ol'; }
+        flushPara();
+        if (!inList || listTag !== 'ol') { closeList(); html += '<ol>'; inList = true; listTag = 'ol'; }
         html += '<li>' + inlineMd(olMatch[1]) + '</li>'; continue;
       }
-      if (inList) { html += '</' + listTag + '>'; inList = false; }
       const bqMatch = line.match(/^> (.*)/);
-      if (bqMatch) { html += '<blockquote>' + inlineMd(bqMatch[1]) + '</blockquote>'; continue; }
-      if (line.trim() === '') { html += '<p></p>'; continue; }
-      html += '<p>' + inlineMd(line) + '</p>';
+      if (bqMatch) {
+        flushPara(); closeList();
+        html += '<blockquote>' + inlineMd(bqMatch[1]) + '</blockquote>'; continue;
+      }
+      if (line.trim() === '') { flushPara(); closeList(); continue; }
+      // Non-blank, non-block line: accumulate into the current paragraph.
+      closeList();
+      paraBuf.push(line);
     }
-    if (inList)  { html += '</' + listTag + '>'; }
+    flushPara();
+    if (inList) { html += '</' + listTag + '>'; }
     if (inCode && codeBuf) {
       const la = codeLang ? ' class="language-' + escHtml(codeLang) + '"' : '';
       html += '<pre><code' + la + '>' + escHtml(codeBuf) + '</code></pre>';
