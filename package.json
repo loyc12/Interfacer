@@ -183,9 +183,10 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
+    "compile": "tsc -p ./ && node scripts/validate-webview.js",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src"
+    "lint": "eslint src",
+    "check-webview": "node scripts/validate-webview.js"
   },
   "devDependencies": {
     "@types/vscode": "^1.80.0",

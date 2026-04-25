@@ -1,17 +1,18 @@
-BUGS :
+TO FIX :
 
-Fix the blinking cursor remaining active once response streaming ends ( start by removing the blinker, and add it back in a way that is easy to discard after ( i.e. a UI only effect ) )
-Check if formating of received api responses works properly, as some things seemed unformated
-Make sure "copy to clipboard" and "add to context" buttons work and are present for each received response, as I failed to find them
+No bugs for now
 
 
 
-TODO :
+TO DO :
 
-no new features to add for now, corrections comes first
+Always fix bugs before adding new features.
+Add a limited sent message history we can "scroll" through with arrow keys, i ncase we want to send an old message ( keep in mind potential future complete message/response history )
+Add a token cost estimation based on the model chosen and official Claude Api prices and consumption.
 
 
 
-IN CONSIDERATION :
+TO CONSIDER :
 
-Check if adding a message history could be useful for context, and how to do that properly
+Check if adding a message history could be worht the hassle ( simplicity vs usefulness ). History ought to be capped to a custom amount of token / messages or smthg
+Look for meaningful polishing / QoL features to add

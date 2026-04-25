@@ -1040,6 +1040,27 @@ function buildWebviewHtml(s: InterfacerSettings): string {
   .ctx-item-meta { flex-shrink: 0; opacity: 0.6; font-size: 0.9em; }
   .ctx-item-rm { flex-shrink: 0; background: none; border: none; cursor: pointer; padding: 0 2px; color: var(--vscode-descriptionForeground); opacity: 0.6; font-size: 1em; line-height: 1; }
   .ctx-item-rm:hover { opacity: 1; }
+  /* Expand chevron — only shown for snippet-kind context items */
+  .ctx-item-chev { flex-shrink: 0; background: none; border: none; cursor: pointer; padding: 0 4px 0 0; color: var(--vscode-descriptionForeground); opacity: 0.7; font-size: 0.85em; line-height: 1; font-family: inherit; }
+  .ctx-item-chev:hover { opacity: 1; }
+  .ctx-item-chev-spacer { flex-shrink: 0; width: 12px; }
+  .ctx-item-preview {
+    display: none;
+    margin: 2px 0 4px 18px;
+    padding: 5px 7px;
+    background: var(--vscode-textBlockQuote-background, var(--vscode-editor-inactiveSelectionBackground));
+    border-radius: 2px;
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 0.78em;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    max-height: 200px;
+    overflow-y: auto;
+    opacity: 0.85;
+  }
+  .ctx-item-wrap.open .ctx-item-preview { display: block; }
   /* preview */
   #preview-wrap { border-top: 1px solid var(--vscode-widget-border, #333); margin-top: 2px; }
   #btn-preview { width: 100%; text-align: left; background: transparent; border: none; cursor: pointer; padding: 4px 6px; font-family: inherit; font-size: 0.78em; color: var(--vscode-descriptionForeground); opacity: 0.7; }
@@ -1459,6 +1480,8 @@ function buildWebviewHtml(s: InterfacerSettings): string {
   let keepCtx      = true;
   let streamMsgDiv = null;  // current streaming message wrapper
   let streamBuf    = '';    // accumulated raw text for the current stream
+  let msgCounter   = 0;     // increments per send(); user msg is M{n}, response is R{n}
+  let currentRId   = '';    // 'R{n}' for the in-flight response (used by streaming + finalize)
 
   let systemPrompt   = ${jsSystemPrompt};
   let presets        = ${jsPresets};
@@ -1614,7 +1637,7 @@ function buildWebviewHtml(s: InterfacerSettings): string {
   svSaveFilters.addEventListener('click', () => {
     blocklist = parsePatterns(svBlocklist);
     allowlist = parsePatterns(svAllowlist);
-    extraTextExts = svExtraExts.value.split('\\n').map((s) => s.trim().replace(/^\./, '')).filter((s) => s.length > 0);
+    extraTextExts = svExtraExts.value.split('\\n').map((s) => s.trim().replace(/^\\./, '')).filter((s) => s.length > 0);
     vscode.postMessage({ type: 'saveFilters', blocklist, allowlist, extraTextExts });
     svFiltersSaved.style.display = 'inline';
     setTimeout(() => { svFiltersSaved.style.display = 'none'; }, 1500);
@@ -1775,19 +1798,46 @@ function buildWebviewHtml(s: InterfacerSettings): string {
     if (previewOpen) { renderPreview(); }
   }
 
+  // Whole files don't get an expand chevron — they can be very long and the
+  // user already chose them deliberately. Snippets (selection / terminal /
+  // response) do get an expand toggle so the user can re-check what's in there.
+  function ctxIsExpandable(kind) {
+    return kind === 'selection' || kind === 'terminal' || kind === 'response';
+  }
+
   function renderCtxList() {
     ctxList.innerHTML = '';
     ctxHeader.classList.toggle('visible', contexts.length > 0);
     contexts.forEach((c) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'ctx-item-wrap';
       const row = document.createElement('div');
       row.className = 'ctx-item';
+      const expandable = ctxIsExpandable(c.kind);
+      const chevronHtml = expandable
+        ? '<button class="ctx-item-chev" title="Show content">▸</button>'
+        : '<span class="ctx-item-chev-spacer"></span>';
       row.innerHTML =
+        chevronHtml +
         '<span class="ctx-item-icon">' + ctxIcon(c.kind) + '</span>' +
         '<span class="ctx-item-name" title="' + escHtml(c.label) + '">' + escHtml(c.label) + '</span>' +
         '<span class="ctx-item-meta">' + ctxMeta(c) + '</span>' +
         '<button class="ctx-item-rm" title="Remove">✕</button>';
       row.querySelector('.ctx-item-rm').addEventListener('click', () => removeContext(c.id));
-      ctxList.appendChild(row);
+      wrap.appendChild(row);
+      if (expandable) {
+        const preview = document.createElement('pre');
+        preview.className = 'ctx-item-preview';
+        preview.textContent = c.content;
+        wrap.appendChild(preview);
+        const chev = row.querySelector('.ctx-item-chev');
+        chev.addEventListener('click', () => {
+          const open = wrap.classList.toggle('open');
+          chev.textContent = open ? '▾' : '▸';
+          chev.title = open ? 'Hide content' : 'Show content';
+        });
+      }
+      ctxList.appendChild(wrap);
     });
   }
 
@@ -1819,7 +1869,7 @@ function buildWebviewHtml(s: InterfacerSettings): string {
     pvPromptEcho.textContent = promptText || '[type below]';
 
     const ctxChars    = contexts.reduce((s, c) => s + c.content.length, 0);
-    const presetChars = preset ? preset.content.length + 2 : 0;  // "\n\n" join
+    const presetChars = preset ? preset.content.length + 2 : 0;  // 2 = blank-line join
     const totalChars  = systemPrompt.length + presetChars + ctxChars + promptText.length;
     pvStats.textContent = '~' + totalChars.toLocaleString() + ' chars · ~' + Math.ceil(totalChars / 4).toLocaleString() + ' tokens est.';
   }
@@ -1849,7 +1899,9 @@ function buildWebviewHtml(s: InterfacerSettings): string {
       ...snapshot.map((c) => c.label),
     ].join(', ') || null;
 
-    addMessage('user', prompt, ctxSummary);
+    msgCounter += 1;
+    currentRId = 'R' + msgCounter;
+    addMessage('user', prompt, ctxSummary, 'M' + msgCounter);
     promptEl.value = '';
     if (!keepCtx) { clearAllContexts(); }
 
@@ -1888,11 +1940,13 @@ function buildWebviewHtml(s: InterfacerSettings): string {
     ctxBtn.title = 'Add this response to context (or right-click the message)';
     ctxBtn.textContent = '↙ Add to context';
     const doAdd = () => {
-      if (ctxBtn.disabled) return;
       const lines = rawText.split('\\n').length;
-      addContext({ label: 'Response', content: rawText, kind: 'response', lineStart: 1, lineEnd: lines });
+      const label = wrapper.dataset.msgId || 'Response';
+      addContext({ label: label, content: rawText, kind: 'response', lineStart: 1, lineEnd: lines });
+      // Brief feedback then revert — same UX as Copy. Permitting re-add lets the
+      // user re-attach a response after they've removed it from the context list.
       ctxBtn.textContent = '✔ Added';
-      ctxBtn.disabled = true;
+      setTimeout(() => { ctxBtn.textContent = '↙ Add to context'; }, 1500);
     };
     ctxBtn.addEventListener('click', doAdd);
     actions.appendChild(copyBtn);
@@ -1904,11 +1958,9 @@ function buildWebviewHtml(s: InterfacerSettings): string {
       const sel = window.getSelection();
       if (sel && sel.toString().length > 0) { return; }
       e.preventDefault();
-      if (ctxBtn.disabled) { return; }
       doAdd();
       wrapper.classList.remove('flash-added');
-      // force reflow so re-adding the class restarts the animation
-      void wrapper.offsetWidth;
+      void wrapper.offsetWidth;  // force reflow so the animation restarts
       wrapper.classList.add('flash-added');
     });
 
@@ -1918,12 +1970,14 @@ function buildWebviewHtml(s: InterfacerSettings): string {
     else { wrapper.appendChild(actions); }
   }
 
-  function addMessage(role, text, ctxSummary) {
+  function addMessage(role, text, ctxSummary, msgId) {
     const wrapper = document.createElement('div');
     wrapper.className = 'msg ' + role;
+    if (msgId) { wrapper.dataset.msgId = msgId; }
     const lbl = document.createElement('div');
     lbl.className = 'msg-label';
-    lbl.textContent = (role === 'user' ? 'You' : 'Assistant') + (ctxSummary ? ' · ' + ctxSummary : '');
+    const who = role === 'user' ? 'You' : 'Assistant';
+    lbl.textContent = (msgId ? msgId + ' · ' : '') + who + (ctxSummary ? ' · ' + ctxSummary : '');
     wrapper.appendChild(lbl);
     const body = document.createElement('div');
     body.className = 'msg-body';
@@ -1944,12 +1998,13 @@ function buildWebviewHtml(s: InterfacerSettings): string {
   // Creates a streaming message placeholder. The blinking cursor is a CSS ::after
   // pseudo-element driven by the 'streaming' class on the wrapper — removing that class
   // (on responseEnd / error / done / etc.) is all that's needed to discard the cursor.
-  function startStreamingMessage() {
+  function startStreamingMessage(msgId) {
     const wrapper = document.createElement('div');
     wrapper.className = 'msg assistant streaming';
+    if (msgId) { wrapper.dataset.msgId = msgId; }
     const lbl = document.createElement('div');
     lbl.className = 'msg-label';
-    lbl.textContent = 'Assistant';
+    lbl.textContent = (msgId ? msgId + ' · ' : '') + 'Assistant';
     wrapper.appendChild(lbl);
     const body = document.createElement('div');
     body.className = 'msg-body';
@@ -1996,7 +2051,7 @@ function buildWebviewHtml(s: InterfacerSettings): string {
   window.addEventListener('message', (e) => {
     const msg = e.data;
     if (msg.type === 'chunk') {
-      if (!streamMsgDiv) { streamMsgDiv = startStreamingMessage(); }
+      if (!streamMsgDiv) { streamMsgDiv = startStreamingMessage(currentRId); }
       streamBuf += msg.text;
       // Show raw text while streaming — the CSS-driven cursor stays visible via the .streaming class.
       streamMsgDiv.body.innerHTML = escHtml(streamBuf);
@@ -2120,9 +2175,9 @@ function buildWebviewHtml(s: InterfacerSettings): string {
       if (!/^(https?:|mailto:|#|\\/|\\.)/i.test(t)) return m;
       return '<a href="' + t + '" target="_blank" rel="noopener noreferrer">' + text + '</a>';
     });
-    s = s.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
-    s = s.replace(/\*\*(.+?)\*\*/g,     '<strong>$1</strong>');
-    s = s.replace(/\*(.+?)\*/g,         '<em>$1</em>');
+    s = s.replace(/\\*\\*\\*(.+?)\\*\\*\\*/g, '<strong><em>$1</em></strong>');
+    s = s.replace(/\\*\\*(.+?)\\*\\*/g,       '<strong>$1</strong>');
+    s = s.replace(/\\*(.+?)\\*/g,             '<em>$1</em>');
     s = s.replace(/_(.+?)_/g,           '<em>$1</em>');
     s = s.replace(_inlineCodeRe,        '<code>$1</code>');
     return s;

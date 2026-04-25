@@ -47,6 +47,55 @@ CLAUDE.md                 — this file
 The webview is a self-contained HTML string returned by `buildWebviewHtml()` with an inline
 `<script nonce="...">` block. All CSS is inline `<style>`. No external resources.
 
+## ⚠ Webview script gotchas — read before editing the `<script>` block
+
+The entire webview is built as a TypeScript template literal. **The `<script>` body is
+plain text inside that template literal** — it is not source code from `tsc`'s perspective,
+so `tsc` cannot catch syntax errors in it. Worse, the template literal silently transforms
+some characters at runtime, which has caused multiple total-UI freezes:
+
+- **`\n`, `\t`, `\r`, `\b`, `\f`, `\v`, `\0`** in the template become real control chars.
+  A `// "\n\n" join` comment becomes a comment terminated at the `"`, then a literal newline,
+  then dangling text — unterminated string, parse error, dead webview.
+- **`\X` for any other letter (`\d`, `\w`, `\s`, `\*`, `\.`, `\[`, `\]`, `\(`, `\)`, …)**
+  is a "NonEscapeCharacter": the backslash is **silently dropped**, leaving just `X`. So
+  `/\*\*\*(.+?)\*\*\*/g` becomes `/***(.+?)***/g` at runtime — invalid regex, parse error,
+  dead webview.
+
+**The rule:** inside the `<script>` block of `buildWebviewHtml()`, every backslash you
+write in source must be `\\`. Doubled. Always. Yes, even in regex literals. Yes, even in
+comments. Yes, even when it "looks fine."
+
+| You want at runtime              | Write in source              |
+|----------------------------------|------------------------------|
+| `\n` (newline char)              | `'\\n'`                      |
+| `\d+` (regex digit)              | `/\\d+/`                     |
+| `\*\*` (literal asterisks)       | `/\\*\\*/`                   |
+| `\\` (literal backslash)         | `'\\\\'`                     |
+| `${expr}` (template interp)      | `\\${expr}` (to suppress)    |
+| `` ` `` (literal backtick)       | `` \\` ``                    |
+
+**The safety net:** `npm run compile` runs `scripts/validate-webview.js` after `tsc`. It
+extracts the `<script>` body from the generated webview HTML and pipes it through
+`node --check`. Any syntax error fails the build with a pointer to this section. Run
+manually any time with `npm run check-webview`.
+
+## Markdown rendering
+
+The webview has a small hand-rolled markdown renderer (`renderMarkdown` / `inlineMd` in
+`buildWebviewHtml`). It currently handles: headings (h1–h3), paragraphs (with line-break
+coalescing), bullet/numbered lists, blockquotes, fenced code, inline code, bold/italic,
+inline links (`[text](url)`, http(s)/mailto/anchor/relative URLs only — javascript:/data:
+rejected for XSS).
+
+It does **not** handle: tables, nested lists, footnotes, task lists, image refs, setext
+headings.
+
+**When to switch to a library** (likely `marked`): if more than one of the above starts
+mattering, replace the hand-rolled code rather than extending it. Tables alone justify
+the swap. `marked` is dependency-free and works inline as a string — no bundler needed,
+just inline the UMD/IIFE at activation time.
+
 ## Key invariants
 
 - **No autonomous behaviour.** Every API call is triggered by an explicit user action.
@@ -57,8 +106,9 @@ The webview is a self-contained HTML string returned by `buildWebviewHtml()` wit
 ## Build & run
 
 ```bash
-npm install       # first time only
-npm run compile   # tsc → out/
+npm install         # first time only
+npm run compile     # tsc → out/, then validate the webview <script>
+npm run check-webview # standalone: just re-run the webview validator
 # Press F5 in VS Code to launch Extension Development Host
 ```
 
