@@ -5,11 +5,19 @@ import * as crypto from 'crypto';
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const DEFAULT_SYSTEM_PROMPT =
-	'You are a code analysis assistant. ' +
-	'Only analyze the provided context — do not assume missing code. ' +
-	'Be concise and direct. ' +
-	'Do not rewrite entire files unless explicitly asked. ' +
-	'Do not suggest changes outside the provided scope.';
+
+'You are a coding assistant for the User.\n' +
+'Your job is to help write, validate, debug, refactor, and plan projects using the User\'s Request and Context.\n' +
+'\nBehaviour Guidelines :\n' +
+'Match the User\'s coding style, conventions, and preferences.\n' +
+'Ask clarifying questions before producing a large or uncertain Response.\n' +
+'Do not assume missing or unclear behavior; state what is missing when relevant.\n' +
+'When planning, start with a broad overview and refine into steps.\n' +
+'Keep codebases compact by reducing duplication and extracting reused logic.\n' +
+'Be concise, direct, and free of unnecessary embellishments and compliments.\n' +
+'Report any major issue you notice, even if that was not the main task.\n' +
+'If you discover a major issue mid-Response, finish cleanly, then mention it.\n' +
+'Do not propose rewrites of entire files unless explicitly asked. ';
 
 const DEFAULT_PRESETS: Preset[] = [
 	{
@@ -1258,6 +1266,7 @@ function buildWebviewHtml(s: InterfacerSettings): string {
     <div class="iv-heading">Header Presets</div>
     <div class="iv-desc">Named instruction snippets, selectable per-message from the dropdown above the textarea. The selected preset is appended to the system prompt for that request only. Managed in ⚙ Settings.</div>
     <div class="iv-row"><span class="iv-key">Dropdown</span><span class="iv-val">Select a preset before sending. Stays selected until changed.</span></div>
+    <div class="iv-row"><span class="iv-key">+ Add new preset…</span><span class="iv-val">Last entry of the dropdown — opens ⚙ Settings with a blank preset form ready to fill in.</span></div>
     <div class="iv-row"><span class="iv-key">Preview</span><span class="iv-val">The preview panel shows "System prompt + preset" when one is active.</span></div>
   </div>
   <div class="iv-section">
@@ -1748,8 +1757,9 @@ function buildWebviewHtml(s: InterfacerSettings): string {
   svResetMaxOutTokens.addEventListener('click', () => { svMaxOutTokens.value = String(DEFAULT_MAX_OUTPUT_TOKENS); });
 
   // ── Preset select in chat ───────────────────────────────────────────────────
+  let lastPresetValue = '';
   function refreshPresetSelect() {
-    const current = presetSelect.value;
+    const current = presetSelect.value === '__add_new__' ? lastPresetValue : presetSelect.value;
     while (presetSelect.options.length > 1) { presetSelect.remove(1); }
     presets.forEach((p, i) => {
       const opt = document.createElement('option');
@@ -1757,15 +1767,20 @@ function buildWebviewHtml(s: InterfacerSettings): string {
       opt.textContent = p.name;
       presetSelect.appendChild(opt);
     });
+    const addOpt = document.createElement('option');
+    addOpt.value = '__add_new__';
+    addOpt.textContent = '+ Add new preset…';
+    presetSelect.appendChild(addOpt);
     // restore selection if still valid
     const idx = presets.findIndex((_, i) => String(i) === current);
     presetSelect.value = idx >= 0 ? String(idx) : '';
+    lastPresetValue = presetSelect.value;
     if (previewOpen) { renderPreview(); }
   }
 
   function selectedPreset() {
     const val = presetSelect.value;
-    if (!val) { return null; }
+    if (!val || val === '__add_new__') { return null; }
     return presets[parseInt(val)] ?? null;
   }
 
@@ -1882,7 +1897,21 @@ function buildWebviewHtml(s: InterfacerSettings): string {
   });
 
   promptEl.addEventListener('input', () => { if (previewOpen) { renderPreview(); } });
-  presetSelect.addEventListener('change', () => { if (previewOpen) { renderPreview(); } });
+  presetSelect.addEventListener('change', () => {
+    if (presetSelect.value === '__add_new__') {
+      presetSelect.value = lastPresetValue;
+      showView('settings');
+      editingIndex = -1;
+      svFormName.value    = '';
+      svFormContent.value = '';
+      svPresetForm.classList.add('open');
+      svPresetForm.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      svFormName.focus();
+      return;
+    }
+    lastPresetValue = presetSelect.value;
+    if (previewOpen) { renderPreview(); }
+  });
 
   // ── Send ────────────────────────────────────────────────────────────────────
   function send() {

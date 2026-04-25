@@ -103,6 +103,13 @@ just inline the UMD/IIFE at activation time.
 - **Context is additive and explicit.** Nothing is sent without the user attaching it.
 - **Secrets never touch `settings.json`.** API key goes through `context.secrets` (OS keychain).
 
+## Working priority — fix bugs before adding features
+
+Before starting a new feature, check the **TO FIX** section of `DevPlans for Interfacer.txt`.
+Resolve any pending bugs first. Shipping new behaviour on top of known-broken behaviour
+multiplies the surface area of debugging later, and the "no autonomous behaviour" invariant
+above means users immediately notice when something they just clicked misbehaves.
+
 ## Build & run
 
 ```bash
