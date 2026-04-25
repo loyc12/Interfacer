@@ -1,16 +1,16 @@
 TO FIX :
 
-No bugs for now :)
+No bugs for now
 
 
 
 TO DO :
 
-Always fix bugs before adding new features ( add "check for bugs first" guideline to CLAUDE.md ? )
+Finish implementing ./claude/TOKEN_EFFICIENCY_PLAN.md
+Split the .gitignore and .vscodeignore filter options into two separate tickboxes
 Add a limited sent message history we can "scroll" through with arrow keys, i ncase we want to send an old message ( keep in mind potential future complete message/response history )
 Add a token cost estimation based on the model chosen and official Claude Api prices and consumption.
 Add meaningful, permanent debug log messages, active only if a "devMode" variable is true, to more easily find behaviour issues when bug arise ( add "put useful debug logs" rule to CLAUDE.md )
-Add a "add new preset" button / redirection at the bottom of the header preset selection list
 
 
 

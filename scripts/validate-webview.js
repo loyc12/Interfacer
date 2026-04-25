@@ -42,11 +42,16 @@ while (depth > 0 && j < compiled.length) {
 }
 const fnSrc = compiled.slice(fnStart, j);
 
-// Wrap into a tiny module that exports buildWebviewHtml.
+// Wrap into a tiny module that exports buildWebviewHtml. We have to stub any
+// module-scope identifiers buildWebviewHtml references — keep this list in
+// sync when extension.ts adds new top-level state surfaced into the webview.
 const wrapperPath = path.join(require('os').tmpdir(), 'interfacer-build-fn.js');
 fs.writeFileSync(wrapperPath, [
 	"const crypto = require('crypto');",
 	'const DEFAULT_SYSTEM_PROMPT = ' + dspMatch[1] + ';',
+	'const MODELS = [{ id: "x", label: "x", pricing: { input:1, output:1, cacheRead:0.1, cacheWrite:1.25 }, cacheMinTokens: 1024 }];',
+	'let observedItpm = 50000;',
+	'let sessionCostUsd = 0;',
 	fnSrc,
 	'module.exports = buildWebviewHtml;',
 ].join('\n'));

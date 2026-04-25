@@ -1,5 +1,16 @@
 # Interfacer — Contributor Guide
 
+## ⚠ READ FIRST: Resume any in-flight work
+
+If [WORK_IN_PROGRESS.md](.claude/WORK_IN_PROGRESS.md) exists at the repo root, **read it before doing anything else**. It is the live handoff from a previous session — it names the active feature, points at the relevant plan in `*_PLAN.md` (or `DevPlans for Interfacer.txt`), lists the ordered task checklist with completion status, and flags any partial-state hazards.
+
+While you work on a multi-step task:
+- Update `WORK_IN_PROGRESS.md` after each completed step (check the box, update **Last touched**).
+- Add gotchas / decisions to the **Notes** section as you discover them.
+- Keep it short — it's a handoff document, not a journal. If a section is no longer load-bearing, trim it.
+
+When the work is fully merged / the user confirms it's done, **delete** `WORK_IN_PROGRESS.md`. A stale WIP file is worse than none.
+
 ## ⚠ CHECKLIST: Update these on every feature change
 
 When you add, remove, or rename **any** user-facing feature, go through this list before closing the PR / ending the session. Skipping items will cause the in-extension help to drift from reality.
@@ -41,6 +52,7 @@ src/extension.ts          — everything: activation, commands, API client, webv
 media/icon.svg            — activity bar icon (monochrome SVG)
 package.json              — manifest: commands, menus, keybindings, settings, views
 CLAUDE.md                 — this file
+.claude/*                 - other claude.relevant files or info
 ```
 
 **No bundler. No framework.** TypeScript compiles directly to `out/extension.js` via `tsc`.
@@ -121,6 +133,6 @@ npm run check-webview # standalone: just re-run the webview validator
 
 ## Adding a new Claude model
 
-1. Add `{ id, label, description }` to the `MODELS` array in `extension.ts`
+1. Add `{ id, label, description }` to the `MODELS` array in `extension.ts` ( confirm this is still valid, update if not )
 2. Update the **Models** section of the info view in `buildWebviewHtml()`
 3. That's it — the QuickPick and status bar pick it up automatically

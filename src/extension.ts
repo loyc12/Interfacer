@@ -40,11 +40,23 @@ const DEFAULT_PRESETS: Preset[] = [
 	},
 ];
 
-const MODELS: { id: string; label: string; description: string }[] = [
-	{ id: 'claude-haiku-4-5-20251001', label: 'Haiku',  description: 'Fast · cheapest' },
-	{ id: 'claude-sonnet-4-6',         label: 'Sonnet', description: 'Balanced' },
-	{ id: 'claude-opus-4-7',           label: 'Opus',   description: 'Most capable · most expensive' },
+// Pricing in USD per million tokens. cacheRead = 0.1 × input, cacheWrite = 1.25 × input
+// per Anthropic's prompt-caching pricing model. All cost figures in the UI are estimates
+// based on these constants — verify against your Anthropic dashboard.
+// pricing last verified: 2026-04-25
+interface ModelPricing { input: number; output: number; cacheRead: number; cacheWrite: number; }
+const MODELS: { id: string; label: string; description: string; pricing: ModelPricing; cacheMinTokens: number }[] = [
+	{ id: 'claude-haiku-4-5-20251001', label: 'Haiku',  description: 'Fast · cheapest',
+	  pricing: { input: 1,  output: 5,  cacheRead: 0.10,  cacheWrite: 1.25  }, cacheMinTokens: 2048 },
+	{ id: 'claude-sonnet-4-6',         label: 'Sonnet', description: 'Balanced',
+	  pricing: { input: 3,  output: 15, cacheRead: 0.30,  cacheWrite: 3.75  }, cacheMinTokens: 1024 },
+	{ id: 'claude-opus-4-7',           label: 'Opus',   description: 'Most capable · most expensive',
+	  pricing: { input: 15, output: 75, cacheRead: 1.50,  cacheWrite: 18.75 }, cacheMinTokens: 1024 },
 ];
+
+// Fallback ITPM ceiling used before any anthropic-ratelimit-* header has been observed.
+// Real value gets overwritten the moment we see a response header. Tier-1 baseline.
+const FALLBACK_ITPM = 50000;
 
 const SECRET_KEY = 'interfacer.apiKey';
 
@@ -90,9 +102,28 @@ interface ContextItem {
 	kind: 'file' | 'selection' | 'terminal' | 'response';
 	lineStart: number;
 	lineEnd: number;
+	// Stable content-derived id used to remember pin state across sessions.
+	// Populated when the extension creates the item; omitted for legacy items.
+	hash?: string;
+	// Whether this item is pinned for the current workspace. Pinned items ride
+	// along on every send as cached system blocks; unpinned items go in the
+	// user message and are billed at full input price.
+	pinned?: boolean;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// FNV-1a 32-bit, hex-padded. Used to derive a stable id from ContextItem content
+// so pinned-context state survives across sessions. The same function is inlined
+// in the webview so response captures can compute matching hashes locally.
+function fnv1aHash(s: string): string {
+	let h = 0x811c9dc5;
+	for (let i = 0; i < s.length; i++) {
+		h ^= s.charCodeAt(i);
+		h = Math.imul(h, 0x01000193);
+	}
+	return (h >>> 0).toString(16).padStart(8, '0');
+}
 
 // ─── Module state ─────────────────────────────────────────────────────────────
 
@@ -107,8 +138,32 @@ let userStopped = false;   // distinguishes user abort from network error
 // Today `lastConversation` is overwritten on each callLLM invocation (single-shot model).
 // Structured as an array so future multi-turn history can simply push further messages.
 type ChatMsg = { role: 'user' | 'assistant'; content: string };
-let lastCallSysPrompt = '';
+type CacheControl = { type: 'ephemeral' };
+type SystemBlock = { type: 'text'; text: string; cache_control?: CacheControl };
+let lastSystemBlocks: SystemBlock[] = [];
 let lastConversation: ChatMsg[] = [];
+
+// Most-recent ITPM ceiling observed from anthropic-ratelimit-input-tokens-limit response
+// header. Updated on every API response. Falls back to FALLBACK_ITPM until the first
+// response arrives. Used by the webview to color-code the per-request input estimate.
+let observedItpm: number = FALLBACK_ITPM;
+
+// Pinned-context state — per-workspace via vscode.Memento. Keys are FNV-1a hashes
+// of context content. Populated in activate() from workspaceState.
+let workspaceMemento: vscode.Memento;
+let pinnedHashes: Set<string> = new Set();
+
+// Cumulative cost in USD spent in this VS Code session. Auto-resets on extension
+// activation. Updated after each successful response from streamed `usage` data.
+let sessionCostUsd: number = 0;
+
+// Fills hash + pinned fields on a ContextItem before posting to the webview.
+// Use this at every extension-side context-creation site so pin state and the
+// stable id are wired up consistently.
+function decoratePin(item: Omit<ContextItem, 'hash' | 'pinned'>): ContextItem {
+	const hash = fnv1aHash(item.content);
+	return { ...item, hash, pinned: pinnedHashes.has(hash) };
+}
 
 async function resolveApiKey(): Promise<string> {
 	return (await secrets.get(SECRET_KEY)) || readSettings().apiKey || process.env.ANTHROPIC_API_KEY || '';
@@ -208,6 +263,14 @@ class InterfacerViewProvider implements vscode.WebviewViewProvider {
 					}
 					break;
 				}
+				case 'pinChanged': {
+					const hash = String(msg.hash || '');
+					if (!hash) { break; }
+					if (msg.pinned) { pinnedHashes.add(hash); }
+					else            { pinnedHashes.delete(hash); }
+					await workspaceMemento.update('pinnedContextHashes', [...pinnedHashes]);
+					break;
+				}
 			}
 		}, null, this.context.subscriptions);
 	}
@@ -232,6 +295,8 @@ class InterfacerViewProvider implements vscode.WebviewViewProvider {
 			maxOutputTokens: s.maxOutputTokens,
 			filterProfiles:  s.filterProfiles,
 			respectIgnore:   s.respectIgnore,
+			observedItpm,
+			sessionCostUsd,
 		});
 	}
 }
@@ -240,6 +305,9 @@ class InterfacerViewProvider implements vscode.WebviewViewProvider {
 
 export function activate(context: vscode.ExtensionContext) {
 	secrets = context.secrets;
+	workspaceMemento = context.workspaceState;
+	pinnedHashes = new Set<string>(workspaceMemento.get<string[]>('pinnedContextHashes') ?? []);
+	sessionCostUsd = 0;
 
 	provider = new InterfacerViewProvider(context);
 	context.subscriptions.push(
@@ -434,11 +502,11 @@ async function addTerminalOutput() {
 
 	provider.post({
 		type: 'addContext',
-		item: {
+		item: decoratePin({
 			label, content: sliced, kind: 'terminal',
 			lineStart: Math.max(1, allLines.length - nLines + 1),
 			lineEnd:   allLines.length,
-		} satisfies ContextItem,
+		}),
 	});
 	provider.focus();
 }
@@ -467,13 +535,13 @@ async function injectSelectionContext() {
 
 	provider.post({
 		type: 'addContext',
-		item: {
+		item: decoratePin({
 			label:     fileName + (isWhole ? '' : ' (selection)') + (truncated ? ' — truncated' : ''),
 			content:   text,
 			kind:      isWhole ? 'file' : 'selection',
 			lineStart: isWhole ? 1 : sel.start.line + 1,
 			lineEnd:   isWhole ? editor.document.lineCount : sel.end.line + 1,
-		} satisfies ContextItem,
+		}),
 	});
 }
 
@@ -680,11 +748,11 @@ async function postFileAsContext(uri: vscode.Uri, maxChars: number): Promise<voi
 	const name = uri.path.split('/').pop() ?? 'file';
 	provider.post({
 		type: 'addContext',
-		item: {
+		item: decoratePin({
 			label: name + (truncated ? ' — truncated' : ''),
 			content: text, kind: 'file',
 			lineStart: 1, lineEnd: text.split('\n').length,
-		} satisfies ContextItem,
+		}),
 	});
 }
 
@@ -727,19 +795,38 @@ function callLLM(prompt: string, contexts: ContextItem[], preset?: string): void
 			return;
 		}
 		const { model, maxOutputTokens, systemPrompt: baseSys } = readSettings();
-		const systemPrompt = preset ? baseSys + '\n\n' + preset : baseSys;
+		const systemText = preset ? baseSys + '\n\n' + preset : baseSys;
+
+		// Split contexts into pinned (cached, ride along on every request from this workspace)
+		// and unpinned (per-send, included in the user message). Pin state lives on the
+		// ContextItem as `pinned: boolean`; unset means unpinned.
+		const pinned   = contexts.filter((c) => c.pinned);
+		const unpinned = contexts.filter((c) => !c.pinned);
+
+		// Block 1: system prompt + active preset. Always cache_control'd — most reused prefix.
+		const systemBlocks: SystemBlock[] = [
+			{ type: 'text', text: systemText, cache_control: { type: 'ephemeral' } },
+		];
+		// Block 2: pinned context items, concatenated. Only added if any items are pinned.
+		// This is breakpoint #2 of the up-to-4 the API allows.
+		if (pinned.length > 0) {
+			const pinnedText = pinned
+				.map((c) => `### ${c.label}\n\`\`\`\n${c.content}\n\`\`\``)
+				.join('\n\n');
+			systemBlocks.push({ type: 'text', text: pinnedText, cache_control: { type: 'ephemeral' } });
+		}
 
 		let userContent = '';
-		if (contexts.length > 0) {
-			userContent = contexts
+		if (unpinned.length > 0) {
+			userContent = unpinned
 				.map((c) => `### ${c.label}\n\`\`\`\n${c.content}\n\`\`\``)
 				.join('\n\n') + '\n\n';
 		}
 		userContent += prompt;
 
-		lastCallSysPrompt = systemPrompt;
-		lastConversation  = [{ role: 'user', content: userContent }];
-		streamRequest(apiKey, systemPrompt, lastConversation, model, maxOutputTokens);
+		lastSystemBlocks = systemBlocks;
+		lastConversation = [{ role: 'user', content: userContent }];
+		streamRequest(apiKey, systemBlocks, lastConversation, model, maxOutputTokens);
 	})();
 }
 
@@ -753,19 +840,19 @@ function continueGeneration(accumulatedText: string): void {
 			{ role: 'assistant', content: accumulatedText },
 			{ role: 'user',      content: 'Please continue.' },
 		];
-		streamRequest(apiKey, lastCallSysPrompt, msgs, model, maxOutputTokens);
+		streamRequest(apiKey, lastSystemBlocks, msgs, model, maxOutputTokens);
 	})();
 }
 
 function streamRequest(
 	apiKey: string,
-	systemPrompt: string,
+	systemBlocks: SystemBlock[],
 	messages: ChatMsg[],
 	model: string,
 	maxTokens: number,
 ): void {
 	const body = JSON.stringify({
-		model, max_tokens: maxTokens, stream: true, system: systemPrompt, messages,
+		model, max_tokens: maxTokens, stream: true, system: systemBlocks, messages,
 	});
 
 	// Guards against double-posting from multiple terminal paths (res.end / error / req error).
@@ -793,6 +880,15 @@ function streamRequest(
 			},
 		},
 		(res) => {
+			// Capture the ITPM ceiling for this tier so the UI can color-code the
+			// per-request input estimate. Updated on every successful response.
+			const itpmHeader = res.headers['anthropic-ratelimit-input-tokens-limit'];
+			const itpm = Number(Array.isArray(itpmHeader) ? itpmHeader[0] : itpmHeader);
+			if (Number.isFinite(itpm) && itpm > 0) {
+				observedItpm = itpm;
+				provider.post({ type: 'updateItpm', itpm });
+			}
+
 			// Non-200 responses come back as plain JSON (auth errors, rate limits, etc.)
 			if (res.statusCode !== 200) {
 				let raw = '';
@@ -806,6 +902,10 @@ function streamRequest(
 			}
 
 			let buf = '';
+			// Anthropic emits initial input/cache token counts in message_start.usage and
+			// finalises output_tokens in message_delta.usage. Accumulate both so we can
+			// compute exact cost at finish time.
+			const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 			res.on('data', (chunk: Buffer) => {
 				buf += chunk.toString();
@@ -828,13 +928,27 @@ function streamRequest(
 								provider.post({ type: 'chunk', text: p.delta.text as string });
 							}
 						} catch { /* ignore malformed event */ }
+					} else if (evtType === 'message_start') {
+						try {
+							const p = JSON.parse(evtData);
+							const u = p.message?.usage;
+							if (u) {
+								usage.input     += Number(u.input_tokens) || 0;
+								usage.cacheRead += Number(u.cache_read_input_tokens) || 0;
+								usage.cacheWrite+= Number(u.cache_creation_input_tokens) || 0;
+							}
+						} catch { /* ignore */ }
 					} else if (evtType === 'message_delta') {
 						try {
 							const p = JSON.parse(evtData);
 							if (p.delta?.stop_reason === 'max_tokens') { hitMaxTokens = true; }
+							const u = p.usage;
+							if (u && typeof u.output_tokens === 'number') {
+								usage.output = u.output_tokens;
+							}
 						} catch { /* ignore */ }
 					} else if (evtType === 'message_stop') {
-						finish(() => provider.post({ type: hitMaxTokens ? 'maxTokensReached' : 'responseEnd' }));
+						finish(() => emitDone());
 					} else if (evtType === 'error') {
 						finish(() => {
 							let m = evtData;
@@ -845,14 +959,33 @@ function streamRequest(
 				}
 			});
 
+			// Compute USD cost from accumulated usage using the active model's pricing,
+			// add to the running session total, and post a single end-of-response event
+			// to the webview that carries cache hits + cost for the response footer.
+			const emitDone = () => {
+				const m = MODELS.find((x) => x.id === model);
+				const p = m?.pricing;
+				let costUsd = 0;
+				if (p) {
+					costUsd =
+						(usage.input      * p.input)      / 1_000_000 +
+						(usage.output     * p.output)     / 1_000_000 +
+						(usage.cacheRead  * p.cacheRead)  / 1_000_000 +
+						(usage.cacheWrite * p.cacheWrite) / 1_000_000;
+					sessionCostUsd += costUsd;
+				}
+				provider.post({
+					type: hitMaxTokens ? 'maxTokensReached' : 'responseEnd',
+					usage, costUsd, sessionCostUsd,
+				});
+				if (userStopped) { userStopped = false; }
+			};
+
 			// Normal stream-end (rare — message_stop should have already fired) and
 			// mid-stream abort from req.destroy() both route here. If the stream
 			// ended without a message_stop but we've already seen stop_reason=
 			// max_tokens, surface the Continue/Done prompt anyway.
-			const endAsStop = () => finish(() => {
-				if (userStopped) { userStopped = false; }
-				provider.post({ type: hitMaxTokens ? 'maxTokensReached' : 'responseEnd' });
-			});
+			const endAsStop = () => finish(() => emitDone());
 			res.on('end', endAsStop);
 			res.on('error', endAsStop);
 		}
@@ -893,6 +1026,9 @@ function buildWebviewHtml(s: InterfacerSettings): string {
 	const jsMaxOutputTokens   = JSON.stringify(s.maxOutputTokens);
 	const jsFilterProfiles    = JSON.stringify(s.filterProfiles);
 	const jsRespectIgnore     = JSON.stringify(s.respectIgnore);
+	const jsModels            = JSON.stringify(MODELS.map((m) => ({ id: m.id, label: m.label, pricing: m.pricing, cacheMinTokens: m.cacheMinTokens })));
+	const jsObservedItpm      = JSON.stringify(observedItpm);
+	const jsSessionCostUsd    = JSON.stringify(sessionCostUsd);
 
 	return /* html */`<!DOCTYPE html>
 <html lang="en">
@@ -940,6 +1076,9 @@ function buildWebviewHtml(s: InterfacerSettings): string {
   /* Continue/Done prompt inside a streaming message */
   .max-tokens-prompt { display: flex; gap: 6px; align-items: center; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--vscode-widget-border, #444); font-size: 0.82em; }
   .max-tokens-prompt span { opacity: 0.65; flex: 1; }
+  /* Cache + cost footer under each finalized assistant message */
+  .msg-cost-footer { margin-top: 6px; font-size: 0.75em; opacity: 0.55; font-family: var(--vscode-editor-font-family, monospace); }
+  .msg-cost-footer .cost-disclaimer { opacity: 0.55; font-style: italic; }
 
   /* back bar (shown at top of info / settings views) */
   .back-bar {
@@ -1048,6 +1187,10 @@ function buildWebviewHtml(s: InterfacerSettings): string {
   .ctx-item-meta { flex-shrink: 0; opacity: 0.6; font-size: 0.9em; }
   .ctx-item-rm { flex-shrink: 0; background: none; border: none; cursor: pointer; padding: 0 2px; color: var(--vscode-descriptionForeground); opacity: 0.6; font-size: 1em; line-height: 1; }
   .ctx-item-rm:hover { opacity: 1; }
+  .ctx-item-pin { flex-shrink: 0; background: none; border: none; cursor: pointer; padding: 0 2px; color: var(--vscode-descriptionForeground); opacity: 0.4; font-size: 0.95em; line-height: 1; }
+  .ctx-item-pin:hover { opacity: 0.85; }
+  .ctx-item-pin.pinned { opacity: 1; color: var(--vscode-textLink-foreground); }
+  .ctx-item.pinned { border-left: 2px solid var(--vscode-textLink-foreground); padding-left: 4px; }
   /* Expand chevron — only shown for snippet-kind context items */
   .ctx-item-chev { flex-shrink: 0; background: none; border: none; cursor: pointer; padding: 0 4px 0 0; color: var(--vscode-descriptionForeground); opacity: 0.7; font-size: 0.85em; line-height: 1; font-family: inherit; }
   .ctx-item-chev:hover { opacity: 1; }
@@ -1501,9 +1644,18 @@ function buildWebviewHtml(s: InterfacerSettings): string {
   let maxOutputTokens  = ${jsMaxOutputTokens};
   let filterProfiles   = ${jsFilterProfiles};
   let respectIgnore    = ${jsRespectIgnore};
+  // Token-efficiency state: model pricing table, observed ITPM (auto-detected from
+  // anthropic-ratelimit-input-tokens-limit response header), cumulative session cost
+  // (auto-resets on extension activation), and the user's monetary soft cap.
+  const MODELS         = ${jsModels};
+  let observedItpm     = ${jsObservedItpm};
+  let sessionCostUsd   = ${jsSessionCostUsd};
+  let sessionCostSoftLimit = 1.0;
   const DEFAULT_SYSTEM_PROMPT   = ${jsDefaultSys};
   const DEFAULT_MAX_CHARS       = 40000;
   const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
+  const DEFAULT_SESSION_COST_SOFT_LIMIT = 1.0;
+  const COST_DISCLAIMER = 'All cost values are estimates based on built-in rates — verify against your Anthropic dashboard.';
 
   // ── View switching ──────────────────────────────────────────────────────────
   function showView(v) {
@@ -1795,7 +1947,21 @@ function buildWebviewHtml(s: InterfacerSettings): string {
       : n + ' lines';
   }
 
+  // FNV-1a 32-bit, hex-padded. Mirrors the extension-side implementation so
+  // hashes computed here (response captures) match hashes the extension sends
+  // (files / selections / terminal). Used as the stable key for pin state.
+  function fnv1aHashJs(s) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return ((h >>> 0).toString(16)).padStart(8, '0');
+  }
+
   function addContext(item) {
+    if (!item.hash) { item.hash = fnv1aHashJs(item.content); }
+    if (item.pinned === undefined) { item.pinned = false; }
     contexts.push({ id: nextId++, ...item });
     renderCtxList();
     if (previewOpen) { renderPreview(); }
@@ -1803,6 +1969,15 @@ function buildWebviewHtml(s: InterfacerSettings): string {
 
   function removeContext(id) {
     contexts = contexts.filter((c) => c.id !== id);
+    renderCtxList();
+    if (previewOpen) { renderPreview(); }
+  }
+
+  function togglePin(id) {
+    const c = contexts.find((x) => x.id === id);
+    if (!c || !c.hash) { return; }
+    c.pinned = !c.pinned;
+    vscode.postMessage({ type: 'pinChanged', hash: c.hash, pinned: c.pinned });
     renderCtxList();
     if (previewOpen) { renderPreview(); }
   }
@@ -1827,18 +2002,23 @@ function buildWebviewHtml(s: InterfacerSettings): string {
       const wrap = document.createElement('div');
       wrap.className = 'ctx-item-wrap';
       const row = document.createElement('div');
-      row.className = 'ctx-item';
+      row.className = 'ctx-item' + (c.pinned ? ' pinned' : '');
       const expandable = ctxIsExpandable(c.kind);
       const chevronHtml = expandable
         ? '<button class="ctx-item-chev" title="Show content">▸</button>'
         : '<span class="ctx-item-chev-spacer"></span>';
+      const pinTitle = c.pinned
+        ? 'Unpin (stop caching across sends in this workspace)'
+        : 'Pin (cache across sends in this workspace)';
       row.innerHTML =
         chevronHtml +
         '<span class="ctx-item-icon">' + ctxIcon(c.kind) + '</span>' +
         '<span class="ctx-item-name" title="' + escHtml(c.label) + '">' + escHtml(c.label) + '</span>' +
         '<span class="ctx-item-meta">' + ctxMeta(c) + '</span>' +
+        '<button class="ctx-item-pin' + (c.pinned ? ' pinned' : '') + '" title="' + pinTitle + '">📌</button>' +
         '<button class="ctx-item-rm" title="Remove">✕</button>';
       row.querySelector('.ctx-item-rm').addEventListener('click', () => removeContext(c.id));
+      row.querySelector('.ctx-item-pin').addEventListener('click', () => togglePin(c.id));
       wrap.appendChild(row);
       if (expandable) {
         const preview = document.createElement('pre');
@@ -1941,7 +2121,8 @@ function buildWebviewHtml(s: InterfacerSettings): string {
 
     vscode.postMessage({
       type: 'send', prompt,
-      contexts: snapshot.map(({ label, content, kind, lineStart, lineEnd }) => ({ label, content, kind, lineStart, lineEnd })),
+      contexts: snapshot.map(({ label, content, kind, lineStart, lineEnd, hash, pinned }) =>
+        ({ label, content, kind, lineStart, lineEnd, hash, pinned: !!pinned })),
       preset: preset ? preset.content : undefined,
     });
   }
@@ -2043,9 +2224,38 @@ function buildWebviewHtml(s: InterfacerSettings): string {
     return { wrapper, body };
   }
 
-  function finalizeStreamingMessage(wrapper, body, rawText) {
+  function fmtNum(n) { return (n || 0).toLocaleString(); }
+  function fmtCost(usd) {
+    if (!isFinite(usd)) { return '~$0'; }
+    if (usd < 0.001) { return '<$0.001'; }
+    if (usd < 1)     { return '~$' + usd.toFixed(4); }
+    return '~$' + usd.toFixed(2);
+  }
+
+  function buildCostFooter(usage, costUsd) {
+    if (!usage) { return null; }
+    const footer = document.createElement('div');
+    footer.className = 'msg-cost-footer';
+    const cached = usage.cacheRead || 0;
+    const written = usage.cacheWrite || 0;
+    const fresh = usage.input || 0;
+    const out = usage.output || 0;
+    let parts = '📦 ' + fmtNum(cached) + ' cached · ' + fmtNum(fresh) + ' new';
+    if (written > 0) { parts += ' · 📤 ' + fmtNum(written) + ' written'; }
+    parts += ' · ' + fmtNum(out) + ' out · ' + fmtCost(costUsd);
+    footer.textContent = parts;
+    return footer;
+  }
+
+  function finalizeStreamingMessage(wrapper, body, rawText, usage, costUsd) {
     body.innerHTML = renderMarkdown(rawText);
     attachMessageActions(wrapper, rawText);
+    const footer = buildCostFooter(usage, costUsd);
+    if (footer) {
+      const existing = wrapper.querySelector('.msg-cost-footer');
+      if (existing) { existing.remove(); }
+      wrapper.appendChild(footer);
+    }
     logEl.scrollTop = logEl.scrollHeight;
   }
 
@@ -2088,17 +2298,22 @@ function buildWebviewHtml(s: InterfacerSettings): string {
     }
     else if (msg.type === 'responseEnd') {
       waiting = false; btnSend.disabled = false; btnStop.classList.remove('visible'); statusEl.textContent = '';
+      if (typeof msg.sessionCostUsd === 'number') { sessionCostUsd = msg.sessionCostUsd; }
       // Capture and clear state before finalize — ensures cleanup even if finalize throws.
       const _div = streamMsgDiv; const _buf = streamBuf;
+      const _usage = msg.usage; const _cost = msg.costUsd;
       streamMsgDiv = null; streamBuf = '';
       if (_div) {
         _div.wrapper.classList.remove('streaming');
-        try { finalizeStreamingMessage(_div.wrapper, _div.body, _buf); } catch(e) { console.error('[Interfacer] finalize error:', e); }
+        try { finalizeStreamingMessage(_div.wrapper, _div.body, _buf, _usage, _cost); } catch(e) { console.error('[Interfacer] finalize error:', e); }
       }
+      if (previewOpen) { renderPreview(); }
     }
     else if (msg.type === 'maxTokensReached') {
       btnStop.classList.remove('visible');
       statusEl.textContent = '';
+      if (typeof msg.sessionCostUsd === 'number') { sessionCostUsd = msg.sessionCostUsd; }
+      const savedUsage = msg.usage; const savedCost = msg.costUsd;
       if (!streamMsgDiv) {
         // Edge case: max_tokens hit before any content arrived, or stream state
         // was lost. Don't leave the UI frozen — re-enable sending and surface
@@ -2140,9 +2355,10 @@ function buildWebviewHtml(s: InterfacerSettings): string {
         });
         doneBtn.addEventListener('click', () => {
           prompt.remove();
-          try { finalizeStreamingMessage(savedDiv.wrapper, savedDiv.body, savedBuf); } catch(e) { console.error('[Interfacer] finalize error:', e); }
+          try { finalizeStreamingMessage(savedDiv.wrapper, savedDiv.body, savedBuf, savedUsage, savedCost); } catch(e) { console.error('[Interfacer] finalize error:', e); }
           streamMsgDiv = null; streamBuf = '';
           waiting = false; btnSend.disabled = false;
+          if (previewOpen) { renderPreview(); }
         });
       }
     }
@@ -2168,6 +2384,9 @@ function buildWebviewHtml(s: InterfacerSettings): string {
       maxOutputTokens = msg.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
       filterProfiles  = msg.filterProfiles ?? [];
       respectIgnore   = msg.respectIgnore ?? true;
+      if (typeof msg.observedItpm     === 'number') { observedItpm     = msg.observedItpm; }
+      if (typeof msg.sessionCostUsd   === 'number') { sessionCostUsd   = msg.sessionCostUsd; }
+      if (typeof msg.sessionCostSoftLimit === 'number') { sessionCostSoftLimit = msg.sessionCostSoftLimit; }
       loadSettingsPrompt();
       syncInfoSystemPrompt();
       renderPresetList();
@@ -2175,6 +2394,10 @@ function buildWebviewHtml(s: InterfacerSettings): string {
       loadFilters();
       loadMaxChars();
       renderFpList();
+      if (previewOpen) { renderPreview(); }
+    }
+    else if (msg.type === 'updateItpm') {
+      if (typeof msg.itpm === 'number' && msg.itpm > 0) { observedItpm = msg.itpm; }
       if (previewOpen) { renderPreview(); }
     }
   });
